@@ -9727,7 +9727,10 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
       {
         inventory: offlineInv,
         runner: (cmd, args) => {
-          if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+          if (
+            (cmd === "android" && args[0] === "emulator" && args[1] === "start") ||
+            (cmd === "emulator" && args.includes("-avd"))
+          ) {
             return { status: 0, stdout: "Started emulator-5554\n", stderr: "" };
           }
           if (cmd === "adb" && args.includes("sys.boot_completed")) {
@@ -9989,7 +9992,8 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
       {
         runner: (cmd, args) => {
           if (cmd === "cp") {
-            return spawnSync(cmd, args, { encoding: "utf8" });
+            fs.cpSync(args.at(-2), args.at(-1), { recursive: true });
+            return { status: 0, stdout: "", stderr: "" };
           }
           return { status: 0, stdout: "", stderr: "" };
         },
@@ -10010,7 +10014,8 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
       {
         runner: (cmd, args) => {
           if (cmd === "cp") {
-            return spawnSync(cmd, args, { encoding: "utf8" });
+            fs.cpSync(args.at(-2), args.at(-1), { recursive: true });
+            return { status: 0, stdout: "", stderr: "" };
           }
           return { status: 0, stdout: "", stderr: "" };
         },
