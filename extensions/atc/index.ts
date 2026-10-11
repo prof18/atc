@@ -3,8 +3,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|atc)\b/i;
-const TOOL_NAMES = ["android", "adb", "emulator", "gradlew", "gradle", "atc"];
+const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
+const TOOL_NAMES = [
+  "android",
+  "adb",
+  "emulator",
+  "gradlew",
+  "gradle",
+  "xcrun",
+  "simctl",
+  "devicectl",
+  "xcodebuild",
+  "atc",
+];
 
 function shellPatToRegExpStr(pat: string, greedy = true): string {
   let out = "";

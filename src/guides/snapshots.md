@@ -2,49 +2,55 @@
 
 Guides: `workflow` · `profiles` · `snapshots` (this page) · `multi-agent` · `traps` (`atc guide <topic>`).
 
-## 1. Claiming a clean device state
+## 1. Reset device state on `atc claim`
 
-When your test requires a known starting state on an emulator, pass reset flags to `atc claim`:
+When your test needs a known starting state, pass reset flags to `atc claim`:
 
-| Flag | What it does |
-|---|---|
-| `--snapshot-load <name>` | Restores QEMU snapshot `<name>` (for example `default_boot` or `clean_login`) before activating the lease. Prefers AVDs that already have that snapshot loaded or stored. |
-| `--snapshot-save-on-free <name>` | Automatically saves snapshot `<name>` when `atc free` releases the lease. |
-| `--wipe-data` | Stops the emulator if running, removes `userdata-qemu.img*` / `cache.img*`, and cold-boots a factory-fresh device. |
-| `--cold` | Boots with `-no-snapshot-load` instead of restoring quickboot state. |
-| `--reset-app <pkg>` | Runs `adb shell pm clear <pkg>` before handing the lease to your session. |
-
-Example:
+| Flag | Android emulator action | iOS Simulator action |
+|---|---|---|
+| `--snapshot-load <name>` | Restores QEMU snapshot `<name>` via `adb emu avd snapshot load` before activating the lease. | Restores APFS copy-on-write (`cp -cR`) snapshot `<name>` from `~/.atc-snapshots/<udid>/<name>` while shutdown, then boots. |
+| `--snapshot-save-on-free <name>` | Saves QEMU snapshot `<name>` when `atc free` releases the lease. | Saves APFS snapshot `<name>` when `atc free` releases the lease. |
+| `--wipe-data` | Stops the emulator if running, deletes `userdata-qemu.img*` / `cache.img*`, and cold-boots clean. | Shuts down the simulator, runs `xcrun simctl erase <udid>`, and boots clean. |
+| `--cold` | Boots with `-no-snapshot-load` instead of restoring quickboot state. | Shuts down and cold-boots the simulator cleanly. |
+| `--reset-app <pkg\|bundleId>` | Runs `adb shell pm clear <pkg>` before handing over the lease. | Stops `<bundleId>`, runs `xcrun simctl privacy <udid> reset all <bundleId>`, and wipes its data container. |
 
 ```bash
+# Android: restore snapshot and clear app storage on claim
 atc claim --type phone --api 36 --snapshot-load default_boot --reset-app com.example.app
+
+# iOS Simulator: reset app permissions and container on claim
+atc claim --ios --type phone --os ">=18.0" --reset-app com.example.iosApp
 ```
 
-## 2. Managing snapshots during an active lease
+## 2. Save and restore snapshots during an active lease
 
-While holding an active emulator lease, use `atc snapshot`:
+While holding an active emulator or simulator lease, use `atc snapshot`:
 
 ```bash
-atc snapshot list                  # list snapshots on the leased AVD
-atc snapshot save before_checkout  # save current RAM/disk state via `adb emu avd snapshot save`
-atc snapshot load before_checkout  # rewind to saved state and wait for boot_completed=1
+atc snapshot list                  # list snapshots on the leased device
+atc snapshot save before_checkout  # QEMU snapshot (Android) or APFS cp -cR clone (iOS Simulator)
+atc snapshot load before_checkout  # rewind to saved state and wait for boot readiness
 atc snapshot delete before_checkout
 ```
 
-You can also save or restore a snapshot atomically when releasing a lease:
+In a Kotlin Multiplatform (KMP) session holding both an Android lease and an iOS lease, pass `--android` or `--ios` (`atc snapshot save clean_state --ios`).
+
+You can also save or load a snapshot when releasing a lease:
 
 ```bash
 atc free --snapshot-save clean_state
 atc free --snapshot-load default_boot
 ```
 
-During `atc free --snapshot-save` or `atc free --stop`, `atc` transitions the lease to `state: "stopping"` under `atc.lock` before running `adb`, so no other agent can claim the emulator mid-save or mid-shutdown.
+During `atc free --snapshot-save` or `atc free --stop`, `atc` marks the lease `"stopping"` under `atc.lock` before calling external tools so no other agent claims the device mid-save or mid-shutdown.
 
 ## 3. Host RAM and disk admission guardrails
 
-Every QEMU emulator consumes guest RAM plus host hypervisor overhead (`qemuOverheadRamMb`, default `1024 MB`) and disk space for userdata/snapshots. Before booting an offline AVD, wiping data, or saving a snapshot, `atc` checks:
+Android QEMU emulators and iOS Simulators use separate concurrency pools and pre-flight resource checks before booting, wiping data, or saving a snapshot:
 
-1. **RAM admission:** Projected available host RAM (accounting for other `"starting"` and recently activated emulators) must cover `ramSizeMb + qemuOverheadRamMb + minFreeRamMb` (default reserve `2048 MB`).
-2. **Per-volume disk admission:** Free disk space on the AVD's filesystem volume (`statfsSync`, accounting for concurrent `"starting"` and `pendingSnapshotDiskMb` reservations on the same volume) must cover the required userdata/snapshot size plus `minFreeDiskMb` (default reserve `2048 MB`).
+| Pool | Default slot cap | Pre-flight admission rule |
+|---|---|---|
+| Android QEMU (`maxRunningEmulators`) | `2` | Projected available RAM must cover `ramSizeMb + qemuOverheadRamMb (1024 MB) + minFreeRamMb (2048 MB)`, and target volume must have `dataDiskMb + minFreeDiskMb (2048 MB)` free disk. |
+| iOS Simulators (`maxRunningSimulators`) | `4` | Target volume (`statfsSync`) must have required snapshot/clone disk plus `minFreeDiskMb (2048 MB)` free disk. |
 
-If either check fails, `atc` exits with code `5` (`ERESOURCE_EXCEEDED`). Free idle emulators with `atc free --stop` first; only pass `--force` if the user explicitly approves bypassing host resource limits.
+If either check fails, `atc` exits with code `5` (`ERESOURCE_EXCEEDED`). Free idle virtual devices with `atc free --stop` first; only pass `--force` if the user approves bypassing host resource limits.

@@ -113,20 +113,49 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const cwd = options.cwd || process.cwd();
   const inventory = options.inventory || null;
   let probedRunningCount = inventory ? (inventory.running || []).length : 0;
+  let probedAndroidRunning = 0;
+  let probedIosRunning = 0;
+  let hasPerPlatformProbe = false;
 
   if (!inventory && options.runningCount === undefined) {
-    const hasUnscopedDeviceAction = splitShellSegments(norm.command).some((seg) => {
-      const c = classifySegment(seg);
-      return c.kind === "device_action" && !c.targetSerial;
-    });
-    if (hasUnscopedDeviceAction) {
-      const runner = options.runner || runCommandSync;
+    const unscopedSegments = splitShellSegments(norm.command)
+      .map((seg) => classifySegment(seg))
+      .filter((c) => c.kind === "device_action" && !c.targetSerial);
+    const runner = options.runner || runCommandSync;
+    if (
+      unscopedSegments.some((c) => (c.targetPlatform || c.platform || "android") === "android")
+    ) {
       const adbRes = runner("adb", ["devices"], { timeoutMs: 3000 });
       if (adbRes.status === 0 && adbRes.stdout !== undefined && adbRes.stdout !== null) {
-        probedRunningCount = parseAdbDevicesOutput(adbRes.stdout).length;
+        probedAndroidRunning = parseAdbDevicesOutput(adbRes.stdout).length;
       } else {
-        probedRunningCount = 2;
+        probedAndroidRunning = 2;
       }
+      probedRunningCount = Math.max(probedRunningCount, probedAndroidRunning);
+      hasPerPlatformProbe = true;
+    }
+    if (unscopedSegments.some((c) => (c.targetPlatform || c.platform) === "ios")) {
+      const simRes = runner("xcrun", ["simctl", "list", "devices", "booted", "--json"], {
+        timeoutMs: 3000,
+      });
+      if (simRes.status === 0 && simRes.stdout !== undefined && simRes.stdout !== null) {
+        try {
+          const parsed = JSON.parse(simRes.stdout);
+          let count = 0;
+          for (const devs of Object.values(parsed?.devices || {})) {
+            if (Array.isArray(devs)) {
+              count += devs.filter((d) => d && d.state === "Booted").length;
+            }
+          }
+          probedIosRunning = count;
+        } catch {
+          probedIosRunning = 2;
+        }
+      } else {
+        probedIosRunning = 2;
+      }
+      probedRunningCount = Math.max(probedRunningCount, probedIosRunning);
+      hasPerPlatformProbe = true;
     }
   } else if (options.runningCount !== undefined) {
     probedRunningCount = options.runningCount;
@@ -166,17 +195,33 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
         }
       }
 
-      const activeLeases = Object.values(state.leases).filter(
+      const allLeases = Object.values(state.leases);
+      const activeLeases = allLeases.filter(
         (l) => l.state === "active" && l.sessionId === norm.sessionId,
       );
-      const totalLeasedCount = Object.keys(state.leases).length;
+      const totalLeasedCount = allLeases.length;
       const runningCount = Math.max(probedRunningCount, totalLeasedCount, activeLeases.length);
+      const runningCountByPlatform = hasPerPlatformProbe
+        ? {
+            android: Math.max(
+              probedAndroidRunning,
+              allLeases.filter((l) => (l.platform || "android") === "android").length,
+              activeLeases.filter((l) => (l.platform || "android") === "android").length,
+            ),
+            ios: Math.max(
+              probedIosRunning,
+              allLeases.filter((l) => l.platform === "ios").length,
+              activeLeases.filter((l) => l.platform === "ios").length,
+            ),
+          }
+        : options.runningCountByPlatform;
 
       const guardRes = evaluateCommandGuard(norm.command, {
         sessionId: norm.sessionId,
         anchorPid: norm.anchorPid,
         activeLeases,
         runningCount,
+        runningCountByPlatform,
         platform: options.platform,
       });
 
@@ -202,7 +247,12 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
               ? new Set([guardRes.targetSerial])
               : null;
         for (const lease of activeLeases) {
-          if (!targeted || targeted.has(lease.serial)) {
+          if (
+            !targeted ||
+            targeted.has(lease.serial) ||
+            (lease.udid && targeted.has(lease.udid)) ||
+            (lease.coreDeviceId && targeted.has(lease.coreDeviceId))
+          ) {
             lease.loadedSnapshot = null;
             lease.renewedAtMs = now;
             lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);

@@ -192,6 +192,7 @@ test("state: GC expires dead leases and cleans stale queue tickets", () => {
 test("state: reconcileOfflineLeases requires 5s dual-source confirmation", () => {
   const now = 1_700_000_000_000;
   const state = createDefaultState();
+  state.config.offlineGraceMs = 5000;
   state.leases["avd:Pixel_8_API_35"] = {
     leaseId: "lease-1",
     deviceKey: "avd:Pixel_8_API_35",
@@ -1280,10 +1281,10 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           state: "active",
           sessionId: "other-sess",
           anchorPid: null,
-          claimedAtMs: now - 20_000,
-          renewedAtMs: now - 20_000,
+          claimedAtMs: now - 60_000,
+          renewedAtMs: now - 60_000,
           expiresAtMs: now + 60_000,
-          firstSeenOfflineAtMs: now - 10_000,
+          firstSeenOfflineAtMs: now - 50_000,
         };
         return { mutated: true };
       });
@@ -2312,6 +2313,15 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         );
 
         // cmdFree restores the lease to active if a snapshot/stop runner throws an exception
+        withStateTransaction(
+          npxDir,
+          (s) => {
+            s.leases["avd:Pixel_8_API_35"].firstSeenOfflineAtMs = null;
+            s.leases["avd:Pixel_8_API_35"].serial = "emulator-5554";
+            return { mutated: true };
+          },
+          { livenessCheck: () => true },
+        );
         const freeThrown = cmdFree(
           npxDir,
           npxClaim.lease.leaseId,
@@ -3766,6 +3776,13 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             );
 
             // 41. cmdSnapshot("load") transitions the lease to "starting" during restoration and restores "active" afterward
+            withStateTransaction(coldRediscoverDir, (s) => {
+              if (s.leases["avd:Pixel_9_API_36"]) {
+                s.leases["avd:Pixel_9_API_36"].firstSeenOfflineAtMs = null;
+                s.leases["avd:Pixel_9_API_36"].serial = "emulator-5558";
+              }
+              return { mutated: true };
+            });
             let stateDuringSnapshotLoad = null;
             const snapLoadRes = cmdSnapshot(
               coldRediscoverDir,
@@ -3880,6 +3897,8 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 cur.workerPid = null;
                 cur.workerPids = [];
                 cur.releaseOnWorkerExit = false;
+                cur.firstSeenOfflineAtMs = null;
+                cur.serial = "emulator-5558";
                 cur.expiresAtMs = now + 3_600_000;
                 return { mutated: true };
               },
@@ -4573,7 +4592,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
 
     // 6. Real-world physical getprop `nosdcard` is not misclassified as `automotive`, and wrapped `android emulator list --long` lines do not emit phantom "Offline" AVDs
     assert.equal(inferDeviceType("Pixel 7 Pro", "nosdcard", "nosdcard"), "phone");
-    assert.equal(inferDeviceType("Pixel Watch 3", "nosdcard,watch", "nosdcard,watch"), "wear");
+    assert.equal(inferDeviceType("Pixel Watch 3", "nosdcard,watch", "nosdcard,watch"), "watch");
     assert.equal(inferDeviceType("Automotive_1080p", "android-automotive", "automotive"), "automotive");
     const wrappedList = parseAndroidEmulatorListOutput(
       [
@@ -5923,8 +5942,9 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         "Crashed AVD whose serial was recycled by another AVD must start offline grace timer",
       );
 
-      // After 6s, second post-activation snapshot revokes Pixel_Crashed while updating Pixel_Just_Booted if it moved to emulator-5558
+      // After recovery grace window, second post-activation snapshot revokes Pixel_Crashed while updating Pixel_Just_Booted if it moved to emulator-5558
       withStateTransaction(reconcileDir, (s) => {
+        s.config.offlineGraceMs = 5000;
         reconcileOfflineLeases(
           s,
           {
@@ -9578,4 +9598,574 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
   }
 });
 
+test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical disconnect fail-fast, and iOS multiplatform support", async () => {
+  const {
+    diagnosePlatformToolingError,
+    inferIosDeviceType,
+    parseDevicectlListJson,
+    parseSimctlListJson,
+    resolveTargetPlatform,
+  } = await import("../src/ios.mjs");
 
+  const dir = makeTempStateDir();
+  try {
+    // 1. Canonical "watch" form factor & "wear" alias normalization
+    assert.equal(inferDeviceType("Wear_OS_Small_Round", "android-wear", "default"), "watch");
+    assert.equal(inferIosDeviceType("Apple Watch Series 10 (46mm)", "Apple Watch", "watchOS-11-4"), "watch");
+    assert.equal(
+      matchesProfile(
+        {
+          platform: "android",
+          kind: "emulator",
+          avd: "Wear_OS_Small_Round",
+          profile: { deviceType: "watch", apiLevel: "android-35" },
+        },
+        { platform: "android", kind: "emulator", deviceType: "wear" },
+      ),
+      true,
+    );
+    assert.equal(
+      matchesProfile(
+        {
+          platform: "android",
+          kind: "emulator",
+          avd: "Wear_OS_Small_Round",
+          profile: { deviceType: "wear", apiLevel: "android-35" },
+        },
+        { platform: "android", kind: "emulator", deviceType: "watch" },
+      ),
+      true,
+    );
+
+    // 2. Virtual device crash recovery in-place (preserving original expiresAtMs)
+    const now0 = Date.now();
+    const origExpiresAtMs = now0 + 300_000;
+    withStateTransaction(dir, (state) => {
+      state.leases["avd:Pixel_9"] = {
+        leaseId: "lease-crash-1",
+        deviceKey: "avd:Pixel_9",
+        platform: "android",
+        kind: "emulator",
+        avd: "Pixel_9",
+        serial: "emulator-5554",
+        profile: {
+          platform: "android",
+          deviceType: "phone",
+          apiLevel: "android-36",
+          services: "play",
+          playStore: true,
+          abi: "arm64-v8a",
+        },
+        sessionId: "sess-recover",
+        anchorPid: process.pid,
+        state: "active",
+        isRecovery: false,
+        requiredRamMb: 3072,
+        claimedAtMs: now0 - 60_000,
+        activatedAtMs: now0 - 60_000,
+        renewedAtMs: now0 - 10_000,
+        expiresAtMs: origExpiresAtMs,
+        firstSeenOfflineAtMs: null,
+      };
+      return { mutated: true };
+    });
+
+    // Reconcile offline: marks firstSeenOfflineAtMs and clears emulator serial
+    const offlineInv = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      queriedPlatforms: ["android"],
+      running: [],
+      offline: [
+        {
+          deviceKey: "avd:Pixel_9",
+          platform: "android",
+          kind: "emulator",
+          avd: "Pixel_9",
+          serial: null,
+          online: false,
+          ramSizeMb: 2048,
+          requiredRamMb: 3072,
+          dataDiskMb: 6656,
+          profile: {
+            platform: "android",
+            deviceType: "phone",
+            apiLevel: "android-36",
+            services: "play",
+            playStore: true,
+            abi: "arm64-v8a",
+          },
+        },
+      ],
+      creatable: [],
+      probes: { emulatorListOk: true, adbDevicesOk: true },
+    };
+
+    const statusOffline = cmdStatus(dir, { android: true }, { inventory: offlineInv });
+    assert.equal(statusOffline.exitCode, 0);
+    assert.ok(statusOffline.leases["avd:Pixel_9"].firstSeenOfflineAtMs);
+    assert.equal(statusOffline.leases["avd:Pixel_9"].serial, null);
+
+    // Offline reservation rejects renew, snapshot, exec, and guard
+    const renewOffline = cmdRenew(dir, null, { session: "sess-recover" });
+    assert.equal(renewOffline.exitCode, 3);
+    assert.match(renewOffline.error, /currently offline/);
+
+    const snapOffline = cmdSnapshot(dir, "save", "snap1", { session: "sess-recover" });
+    assert.equal(snapOffline.exitCode, 3);
+    assert.match(snapOffline.error, /currently offline/);
+
+    const guardOffline = cmdGuard(dir, "adb shell getprop ro.build.version.sdk", {
+      session: "sess-recover",
+    });
+    assert.equal(guardOffline.exitCode, 2);
+    assert.match(guardOffline.reason, /crashed or went offline/);
+
+    // Owner re-claims within 45s recovery window -> reboots in-place and preserves original expiresAtMs
+    const recoverClaim = cmdClaim(
+      dir,
+      { session: "sess-recover", type: "phone", ttl: 600, wait: 0 },
+      {
+        inventory: offlineInv,
+        runner: (cmd, args) => {
+          if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+            return { status: 0, stdout: "Started emulator-5554\n", stderr: "" };
+          }
+          if (cmd === "adb" && args.includes("sys.boot_completed")) {
+            return { status: 0, stdout: "1\n", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(recoverClaim.exitCode, 0);
+    assert.equal(recoverClaim.recovered, true);
+    assert.equal(recoverClaim.lease.leaseId, "lease-crash-1");
+    assert.equal(recoverClaim.lease.serial, "emulator-5554");
+    assert.equal(recoverClaim.lease.isRecovery, false);
+    assert.equal(recoverClaim.lease.firstSeenOfflineAtMs, null);
+    assert.equal(
+      recoverClaim.lease.expiresAtMs,
+      origExpiresAtMs,
+      "In-place crash recovery must preserve original expiresAtMs without extending claim duration",
+    );
+
+    // Non-executable offline reservation can be freed immediately without external commands
+    withStateTransaction(dir, (state, { now }) => {
+      state.leases["avd:Pixel_9"].firstSeenOfflineAtMs = now - 2_000;
+      state.leases["avd:Pixel_9"].serial = null;
+      state.leases["avd:Pixel_9"].saveSnapshotOnFree = "should_not_run";
+      return { mutated: true };
+    });
+    const freeOfflineCalls = [];
+    const freeOfflineRes = cmdFree(
+      dir,
+      null,
+      { session: "sess-recover", stop: true },
+      {
+        runner: (cmd, args) => {
+          freeOfflineCalls.push([cmd, ...args].join(" "));
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(freeOfflineRes.exitCode, 0);
+    assert.equal(freeOfflineCalls.length, 0, "Freeing an offline reservation must not run adb/stop commands");
+    assert.equal(readState(dir).leases["avd:Pixel_9"], undefined);
+
+    // 3. Physical device disconnect fail-fast (within 15s window & via tombstone after 15s)
+    withStateTransaction(dir, (state, { now }) => {
+      state.leases["serial:PHYS123"] = {
+        leaseId: "lease-phys-1",
+        deviceKey: "serial:PHYS123",
+        platform: "android",
+        kind: "physical",
+        avd: null,
+        serial: "PHYS123",
+        profile: {
+          platform: "android",
+          deviceType: "phone",
+          deviceName: "Pixel 7 Pro",
+          apiLevel: "android-36",
+          services: "play",
+          playStore: true,
+          abi: "arm64-v8a",
+        },
+        sessionId: "sess-phys",
+        anchorPid: process.pid,
+        state: "active",
+        claimedAtMs: now - 30_000,
+        activatedAtMs: now - 30_000,
+        renewedAtMs: now - 5_000,
+        expiresAtMs: now + 300_000,
+        firstSeenOfflineAtMs: now - 2_000,
+      };
+      return { mutated: true };
+    });
+
+    const physFailFast1 = cmdClaim(
+      dir,
+      { session: "sess-phys", serial: "PHYS123", wait: 60 },
+      { inventory: offlineInv },
+    );
+    assert.equal(physFailFast1.exitCode, 1);
+    assert.match(
+      physFailFast1.error,
+      /Physical device "PHYS123" disconnected while leased and cannot be restarted automatically/,
+    );
+    assert.equal(readState(dir).leases["serial:PHYS123"], undefined);
+
+    // After 15s grace window expires, reconcileOfflineLeases records tombstone in disconnectedPhysicalLeases
+    withStateTransaction(dir, (state, { now }) => {
+      state.leases["serial:PHYS456"] = {
+        leaseId: "lease-phys-2",
+        deviceKey: "serial:PHYS456",
+        platform: "android",
+        kind: "physical",
+        avd: null,
+        serial: "PHYS456",
+        profile: {
+          platform: "android",
+          deviceType: "phone",
+          deviceName: "Pixel 7 Pro",
+          apiLevel: "android-36",
+        },
+        sessionId: "sess-phys-2",
+        anchorPid: process.pid,
+        state: "active",
+        claimedAtMs: now - 40_000,
+        activatedAtMs: now - 40_000,
+        renewedAtMs: now - 25_000,
+        expiresAtMs: now + 300_000,
+        firstSeenOfflineAtMs: now - 20_000,
+      };
+      reconcileOfflineLeases(state, offlineInv, "other-sess", now);
+      return { mutated: true };
+    });
+    const postTombState = readState(dir);
+    assert.equal(postTombState.leases["serial:PHYS456"], undefined);
+    assert.ok(postTombState.disconnectedPhysicalLeases["lease-phys-2"]);
+
+    const physFailFast2 = cmdClaim(
+      dir,
+      { session: "sess-phys-2", serial: "PHYS456", wait: 60 },
+      { inventory: offlineInv },
+    );
+    assert.equal(physFailFast2.exitCode, 1);
+    assert.match(
+      physFailFast2.error,
+      /Physical device "PHYS456" disconnected while leased and cannot be restarted automatically/,
+    );
+    assert.equal(readState(dir).disconnectedPhysicalLeases["lease-phys-2"], undefined);
+
+    // 4. Multiplatform iOS resolution, parsing, diagnostics, lifecycle, snapshots, exec, and guard
+    assert.equal(resolveTargetPlatform({ ios: true }), "ios");
+    assert.equal(resolveTargetPlatform({ android: true }), "android");
+    assert.equal(resolveTargetPlatform({ udid: "D9746857-E328-43FF-A79B-42CDE3AD9D71" }), "ios");
+    assert.equal(resolveTargetPlatform({ os: ">=18.0" }), "ios");
+    assert.equal(resolveTargetPlatform({ avd: "iPhone 16 Pro" }), "ios");
+    assert.throws(() => resolveTargetPlatform({ ios: true, android: true }), /Cannot specify both/);
+
+    const simUdid = "D9746857-E328-43FF-A79B-42CDE3AD9D71";
+    const simDataDir = path.join(dir, "mock-sim-data");
+    fs.mkdirSync(simDataDir, { recursive: true });
+    fs.writeFileSync(path.join(simDataDir, "marker.txt"), "v1", "utf8");
+
+    const parsedSim = parseSimctlListJson(
+      {
+        runtimes: [
+          {
+            identifier: "com.apple.CoreSimulator.SimRuntime.iOS-18-4",
+            name: "iOS 18.4",
+            version: "18.4",
+            isAvailable: true,
+          },
+        ],
+        devicetypes: [
+          {
+            identifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro",
+            name: "iPhone 16 Pro",
+            productFamily: "iPhone",
+          },
+        ],
+        devices: {
+          "com.apple.CoreSimulator.SimRuntime.iOS-18-4": [
+            {
+              udid: simUdid,
+              name: "iPhone 16 Pro",
+              state: "Booted",
+              isAvailable: true,
+              dataPath: simDataDir,
+              deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro",
+            },
+          ],
+        },
+      },
+      { stateDir: dir, host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536 } },
+    );
+    assert.equal(parsedSim.running.length, 1);
+    assert.equal(parsedSim.running[0].deviceKey, `sim:${simUdid}`);
+    assert.equal(parsedSim.running[0].profile.osVersion, "iOS-18.4");
+    assert.equal(parsedSim.running[0].profile.deviceType, "phone");
+
+    const parsedDevCtl = parseDevicectlListJson({
+      result: {
+        devices: [
+          {
+            identifier: "CORE-UUID-1111",
+            connectionProperties: { pairingState: "paired", tunnelState: "connected", transportType: "wired" },
+            hardwareProperties: { udid: "00008130-0011223344556677", platform: "iOS", marketingName: "iPhone 15 Pro", reality: "physical" },
+            deviceProperties: { name: "Seb's iPhone", osVersionNumber: "18.3.1" },
+          },
+          {
+            identifier: "CORE-UUID-2222",
+            properties: {
+              connection: { pairingState: "paired", state: "disconnected", transportType: "wired" },
+              hardware: { udid: "00008140-00AABBCCDDEEFF00", platform: "iOS", marketingName: "iPhone 16", reality: "physical", cpuType: { type: 16777228, subtype: 0 } },
+              software: { osVersionNumber: { stringValue: "18.4" } },
+              state: { name: "Seb's iPhone 16", visibilityClass: "default" },
+            },
+          },
+          {
+            identifier: simUdid,
+            visibilityClass: "simulators",
+            connectionProperties: { pairingState: "paired", tunnelState: "disconnected", transportType: "sameMachine" },
+            hardwareProperties: { udid: simUdid, platform: "iOS", marketingName: "iPhone 16 Pro", reality: "simulated" },
+            deviceProperties: { name: "iPhone 16 Pro", osVersionNumber: "18.4", provider: "com.apple.CoreSimulator.SimulatorCoreDevicePlugin" },
+          },
+        ],
+      },
+    });
+    assert.equal(parsedDevCtl.length, 2);
+    assert.equal(parsedDevCtl[0].deviceKey, "serial:00008130-0011223344556677");
+    assert.equal(parsedDevCtl[0].profile.osVersion, "iOS-18.3.1");
+    assert.equal(parsedDevCtl[1].deviceKey, "serial:00008140-00AABBCCDDEEFF00");
+    assert.equal(parsedDevCtl[1].profile.osVersion, "iOS-18.4");
+    assert.equal(parsedDevCtl[1].profile.deviceName, "Seb's iPhone 16");
+
+    // Pre-flight tooling diagnostics
+    assert.match(
+      diagnosePlatformToolingError("ios", { deviceType: "phone" }, {}, { platform: "linux" }),
+      /iOS targets require macOS/,
+    );
+    assert.match(
+      diagnosePlatformToolingError(
+        "ios",
+        { deviceType: "watch" },
+        {
+          running: [],
+          offline: [],
+          availableRuntimesByFamily: { iOS: 1, watchOS: 0, tvOS: 0, visionOS: 0 },
+          probes: { simctlListOk: true, simctlStatus: 0 },
+        },
+        { platform: "darwin" },
+      ),
+      /xcodebuild -downloadPlatform watchOS/,
+    );
+
+    // Claim warm iOS Simulator, save/load/delete APFS snapshot, guard & exec
+    const iosInv = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      queriedPlatforms: ["ios"],
+      running: parsedSim.running,
+      offline: [],
+      creatable: parsedSim.creatable,
+      probes: { simctlListOk: true, devicectlListOk: true },
+    };
+    const iosClaim = cmdClaim(
+      dir,
+      { session: "sess-ios", ios: true, type: "phone", os: ">=18.0" },
+      { inventory: iosInv },
+    );
+    assert.equal(iosClaim.exitCode, 0);
+    assert.equal(iosClaim.lease.platform, "ios");
+    assert.equal(iosClaim.lease.serial, simUdid);
+
+    // Save APFS snapshot "clean_ios", mutate marker.txt, load snapshot, verify restored
+    const snapSaveRes = cmdSnapshot(
+      dir,
+      "save",
+      "clean_ios",
+      { session: "sess-ios", force: true },
+      {
+        runner: (cmd, args) => {
+          if (cmd === "cp") {
+            return spawnSync(cmd, args, { encoding: "utf8" });
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(snapSaveRes.exitCode, 0);
+
+    const snapListRes = cmdSnapshot(dir, "list", null, { session: "sess-ios" });
+    assert.equal(snapListRes.exitCode, 0);
+    assert.deepEqual(snapListRes.snapshots, ["clean_ios"]);
+
+    fs.writeFileSync(path.join(simDataDir, "marker.txt"), "mutated", "utf8");
+    const snapLoadRes = cmdSnapshot(
+      dir,
+      "load",
+      "clean_ios",
+      { session: "sess-ios" },
+      {
+        runner: (cmd, args) => {
+          if (cmd === "cp") {
+            return spawnSync(cmd, args, { encoding: "utf8" });
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(snapLoadRes.exitCode, 0);
+    assert.equal(fs.readFileSync(path.join(simDataDir, "marker.txt"), "utf8"), "v1");
+
+    const snapDelRes = cmdSnapshot(dir, "delete", "clean_ios", { session: "sess-ios" });
+    assert.equal(snapDelRes.exitCode, 0);
+
+    // iOS buildChildInvocation rewrites "booted" -> simUdid and injects SIMULATOR_UDID & ATC_PLATFORM=ios
+    const iosChildInv = buildChildInvocation(
+      "xcrun",
+      ["simctl", "launch", "booted", "com.example.App"],
+      iosClaim.lease,
+      "sess-ios",
+      {},
+    );
+    assert.deepEqual(iosChildInv.args, ["simctl", "launch", simUdid, "com.example.App"]);
+    assert.equal(iosChildInv.env.ATC_PLATFORM, "ios");
+    assert.equal(iosChildInv.env.SIMULATOR_UDID, simUdid);
+    assert.equal(iosChildInv.env.ATC_DEVICE_SERIAL, simUdid);
+
+    const iosDevctlInv = buildChildInvocation(
+      "xcrun",
+      ["devicectl", "device", "info", "details"],
+      { ...iosClaim.lease, kind: "physical", serial: "00008120-000464CE2E44C01E", udid: "00008120-000464CE2E44C01E" },
+      "sess-ios",
+      {},
+    );
+    assert.deepEqual(iosDevctlInv.args, [
+      "devicectl",
+      "device",
+      "info",
+      "details",
+      "--device",
+      "00008120-000464CE2E44C01E",
+    ]);
+    assert.throws(
+      () =>
+        buildChildInvocation(
+          "xcrun",
+          ["devicectl", "device", "info", "details", "--device", "OTHER-UDID"],
+          { ...iosClaim.lease, kind: "physical", serial: "00008120-000464CE2E44C01E", udid: "00008120-000464CE2E44C01E" },
+          "sess-ios",
+          {},
+        ),
+      /Conflicting device selector "OTHER-UDID"/,
+    );
+
+    // iOS guard rules: block lifecycle commands, allow & rewrite device actions with active iOS lease
+    const guardSimBoot = evaluateCommandGuard(`xcrun simctl boot ${simUdid}`, {
+      sessionId: "sess-ios",
+      activeLeases: [iosClaim.lease],
+    });
+    assert.equal(guardSimBoot.allowed, false);
+    assert.match(guardSimBoot.reason, /xcrun simctl boot.*disabled under ATC/);
+
+    const guardXcodeTestNoLease = evaluateCommandGuard(
+      "xcodebuild test -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16 Pro'",
+      { sessionId: "sess-none", activeLeases: [] },
+    );
+    assert.equal(guardXcodeTestNoLease.allowed, false);
+
+    const guardSimLaunchAllowed = evaluateCommandGuard(
+      "xcrun simctl launch booted com.example.App",
+      {
+        sessionId: "sess-ios",
+        activeLeases: [iosClaim.lease],
+        runningCount: 1,
+        platform: "darwin",
+      },
+    );
+    assert.equal(guardSimLaunchAllowed.allowed, true);
+    assert.match(
+      guardSimLaunchAllowed.rewrittenCommand,
+      new RegExp(`atc exec --serial ${simUdid} -- xcrun simctl launch booted com.example.App`),
+    );
+
+    // 7. KMP dual-lease session (1 Android lease + 1 iOS lease in the same session)
+    const kmpAndroidInv = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      queriedPlatforms: ["android"],
+      running: [
+        {
+          deviceKey: "avd:Pixel_9",
+          platform: "android",
+          kind: "emulator",
+          avd: "Pixel_9",
+          serial: "emulator-5554",
+          online: true,
+          ramSizeMb: 2048,
+          requiredRamMb: 3072,
+          profile: {
+            platform: "android",
+            deviceType: "phone",
+            apiLevel: "android-36",
+            services: "play",
+            playStore: true,
+            abi: "arm64-v8a",
+          },
+        },
+      ],
+      offline: [],
+      creatable: [],
+      probes: { emulatorListOk: true, adbDevicesOk: true },
+    };
+    const kmpAndroidClaim = cmdClaim(
+      dir,
+      { android: true, type: "phone", session: "sess-ios" },
+      { inventory: kmpAndroidInv },
+    );
+    assert.equal(kmpAndroidClaim.exitCode, 0);
+    assert.equal(kmpAndroidClaim.lease.platform, "android");
+    assert.equal(kmpAndroidClaim.lease.serial, "emulator-5554");
+
+    // Platform-scoped renew in a dual-lease KMP session
+    const kmpRenewUnscoped = cmdRenew(dir, null, { session: "sess-ios", ttl: 500 });
+    assert.equal(kmpRenewUnscoped.exitCode, 1);
+    assert.match(kmpRenewUnscoped.error, /--android\/--ios/);
+
+    const kmpRenewIos = cmdRenew(dir, null, { session: "sess-ios", ios: true, ttl: 500 });
+    assert.equal(kmpRenewIos.exitCode, 0);
+    assert.equal(kmpRenewIos.lease.platform, "ios");
+
+    const kmpRenewAndroid = cmdRenew(dir, null, { session: "sess-ios", android: true, ttl: 500 });
+    assert.equal(kmpRenewAndroid.exitCode, 0);
+    assert.equal(kmpRenewAndroid.lease.platform, "android");
+
+    // Compound KMP command guard with 1 Android + 1 iOS lease and per-platform runningCountByPlatform
+    const kmpCompoundGuard = evaluateCommandGuard(
+      "adb -s emulator-5554 install app.apk && xcrun simctl install booted iosApp.app",
+      {
+        sessionId: "sess-ios",
+        activeLeases: [kmpAndroidClaim.lease, iosClaim.lease],
+        runningCount: 2,
+        runningCountByPlatform: { android: 2, ios: 1 },
+        platform: "darwin",
+      },
+    );
+    assert.equal(kmpCompoundGuard.allowed, true);
+    assert.match(
+      kmpCompoundGuard.rewrittenCommand,
+      new RegExp(
+        `atc exec --serial emulator-5554 -- adb -s emulator-5554 install app\\.apk && .*atc exec --serial ${simUdid} -- xcrun simctl install booted iosApp\\.app`,
+      ),
+    );
+
+    // Platform-scoped free in a dual-lease KMP session
+    const kmpFreeAndroid = cmdFree(dir, null, { session: "sess-ios", android: true });
+    assert.equal(kmpFreeAndroid.exitCode, 0);
+    assert.deepEqual(kmpFreeAndroid.freed, [kmpAndroidClaim.lease.leaseId]);
+    assert.ok(readState(dir).leases[iosClaim.lease.deviceKey]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

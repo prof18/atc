@@ -4,17 +4,20 @@
   "owner": {
     "name": "Sebastiano Poggi"
   },
-  "description": "Android Traffic Control for coding agents: exclusive Android emulator and physical device leases, warm-affinity queueing, and multi-agent guardrails.",
+  "description": "Agent Traffic Control for coding agents: exclusive Android emulator, iOS Simulator, and physical device leases, warm-affinity queueing, and multi-agent guardrails.",
   "plugins": [
     {
       "name": "atc",
       "source": "./",
-      "description": "Coordinate exclusive Android emulator (AVD) and physical device leases across concurrent coding agents with the atc CLI, hooks, and MCP server.",
+      "description": "Coordinate exclusive Android emulator (AVD), iOS Simulator, and physical device leases across concurrent coding agents with the atc CLI, hooks, and MCP server.",
       "category": "Development",
       "tags": [
         "android",
+        "ios",
+        "simulator",
         "emulator",
         "adb",
+        "simctl",
         "testing",
         "multi-agent"
       ]

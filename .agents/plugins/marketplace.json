@@ -1,7 +1,7 @@
 {
   "name": "atc",
   "interface": {
-    "displayName": "Android Traffic Control"
+    "displayName": "Agent Traffic Control"
   },
   "plugins": [
     {

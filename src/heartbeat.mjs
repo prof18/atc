@@ -25,6 +25,9 @@ function runHeartbeatTick() {
           lease.workerPid === workerPid &&
           (lease.state === "starting" || lease.state === "stopping")
         ) {
+          if (lease.isRecovery && typeof lease.expiresAtMs === "number" && now >= lease.expiresAtMs) {
+            return { mutated: false };
+          }
           lease.deadlineMs = now + timeoutMs;
           return { mutated: true };
         }

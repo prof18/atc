@@ -240,9 +240,11 @@ export function getAncestorPids(startPid = process.ppid) {
 
 export const DEFAULT_CONFIG = Object.freeze({
   maxRunningEmulators: 2,
+  maxRunningSimulators: 4,
   minFreeRamMb: 2048,
   minFreeDiskMb: 2048,
   qemuOverheadRamMb: 1024,
+  simOverheadRamMb: 1280,
   defaultTtlSec: 600,
   maxTtlSec: 3600,
   defaultWaitSec: 300,
@@ -250,7 +252,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   queueHeartbeatTimeoutSec: 10,
   bootTimeoutSec: 180,
   stopTimeoutSec: 60,
-  offlineGraceMs: 5000,
+  offlineGraceMs: 45000,
+  physicalOfflineGraceMs: 15000,
   autoStopIdleOnContention: true,
   allowPhysicalDevices: "explicit",
   allowedPhysicalSerials: [],
@@ -261,6 +264,7 @@ export function createDefaultState() {
     version: 1,
     config: structuredClone(DEFAULT_CONFIG),
     leases: {},
+    disconnectedPhysicalLeases: {},
     queue: [],
     hookSessions: {},
     lastOrphanSweepAtMs: 0,
@@ -312,6 +316,12 @@ function parseStateContent(raw) {
     throw new Error("Invalid state.json top-level schema");
   }
   parsed.config = { ...DEFAULT_CONFIG, ...parsed.config };
+  if (
+    !parsed.disconnectedPhysicalLeases ||
+    typeof parsed.disconnectedPhysicalLeases !== "object"
+  ) {
+    parsed.disconnectedPhysicalLeases = {};
+  }
   return parsed;
 }
 
@@ -898,6 +908,21 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
       }
     }
   }
+  if (
+    state.disconnectedPhysicalLeases &&
+    typeof state.disconnectedPhysicalLeases === "object"
+  ) {
+    for (const [k, tomb] of Object.entries(state.disconnectedPhysicalLeases)) {
+      if (
+        !tomb ||
+        typeof tomb.expiresAtMs !== "number" ||
+        now >= tomb.expiresAtMs ||
+        (typeof tomb.disconnectedAtMs === "number" && now < tomb.disconnectedAtMs)
+      ) {
+        delete state.disconnectedPhysicalLeases[k];
+      }
+    }
+  }
 
   if (stateDir && (!state.lastOrphanSweepAtMs || now - state.lastOrphanSweepAtMs > 60_000)) {
     state.lastOrphanSweepAtMs = now;
@@ -1124,6 +1149,15 @@ export function recordDeviceBootedInState(state, deviceInfo, now = Date.now()) {
   }
 }
 
+export function isLeaseExecutable(lease) {
+  return Boolean(
+    lease &&
+      lease.state === "active" &&
+      (lease.firstSeenOfflineAtMs === null || lease.firstSeenOfflineAtMs === undefined) &&
+      lease.serial,
+  );
+}
+
 export function reconcileOfflineLeases(
   state,
   inventory,
@@ -1134,22 +1168,59 @@ export function reconcileOfflineLeases(
 ) {
   if (!inventory) return false;
   let mutated = false;
-  const graceMs = state.config?.offlineGraceMs ?? 5000;
-  const probes = inventory.probes || { emulatorListOk: true, adbDevicesOk: true };
+  const queriedPlatforms = Array.isArray(inventory.queriedPlatforms)
+    ? new Set(inventory.queriedPlatforms.map((p) => String(p).toLowerCase()))
+    : null;
+  const probes = inventory.probes || {
+    emulatorListOk: true,
+    adbDevicesOk: true,
+    simctlListOk: true,
+    devicectlListOk: true,
+  };
   const emulatorListOk = probes.emulatorListOk !== false;
   const adbDevicesOk = probes.adbDevicesOk !== false;
+  const simctlListOk = probes.simctlListOk !== false;
+  const devicectlListOk = probes.devicectlListOk !== false;
   const onlineAvds = new Set(
-    (inventory.running || []).filter((d) => d.kind === "emulator").map((d) => d.avd),
+    (inventory.running || [])
+      .filter((d) => d.kind === "emulator" && (d.platform || "android") === "android")
+      .map((d) => d.avd),
+  );
+  const onlineSimSerials = new Set(
+    (inventory.running || [])
+      .filter(
+        (d) =>
+          d.kind === "emulator" && (d.platform === "ios" || d.deviceKey?.startsWith("sim:")),
+      )
+      .map((d) => d.serial)
+      .filter(Boolean),
   );
   const onlineSerials = new Set([
     ...(inventory.running || []).map((d) => d.serial).filter(Boolean),
-    ...(inventory.onlineSerials || []).filter(Boolean),
+    ...Array.from(inventory.onlineSerials || []).filter(Boolean),
   ]);
 
   for (const [deviceKey, lease] of Object.entries(state.leases)) {
-    if ((!lease.avd || deviceKey.startsWith("serial:")) && lease.kind === "emulator" && lease.serial) {
+    const leasePlatform = (
+      lease.platform ||
+      lease.profile?.platform ||
+      (deviceKey.startsWith("sim:") ? "ios" : "android")
+    ).toLowerCase();
+    if (queriedPlatforms && !queriedPlatforms.has(leasePlatform)) {
+      continue;
+    }
+    if (
+      leasePlatform === "android" &&
+      (!lease.avd || deviceKey.startsWith("serial:")) &&
+      lease.kind === "emulator" &&
+      lease.serial
+    ) {
       const mappedDev = (inventory.running || []).find(
-        (d) => d.kind === "emulator" && d.serial === lease.serial && d.avd,
+        (d) =>
+          d.kind === "emulator" &&
+          (d.platform || "android") === "android" &&
+          d.serial === lease.serial &&
+          d.avd,
       );
       if (mappedDev && mappedDev.deviceKey && mappedDev.deviceKey !== deviceKey) {
         const destLease = state.leases[mappedDev.deviceKey];
@@ -1234,11 +1305,22 @@ export function reconcileOfflineLeases(
       if (requiredFreshAfterMs > 0 && now < requiredFreshAfterMs) {
         continue;
       }
+      if (leasePlatform === "ios") {
+        if (!simctlListOk) continue;
+        if (lease.serial && onlineSimSerials.has(lease.serial)) continue;
+        recordDeviceStoppedInState(state, lease, now);
+        delete state.leases[deviceKey];
+        mutated = true;
+        continue;
+      }
       if (!emulatorListOk || !adbDevicesOk) continue;
       const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
       const hasUnmappedEmulator = Boolean(
-        lease.avd && (inventory.running || []).some((d) => d.kind === "emulator" && !d.avd),
+        lease.avd &&
+          (inventory.running || []).some(
+            (d) => d.kind === "emulator" && (d.platform || "android") === "android" && !d.avd,
+          ),
       );
       if (avdOnline || serialOnline || hasUnmappedEmulator) continue;
       const otherActiveAvds = new Set([
@@ -1294,21 +1376,45 @@ export function reconcileOfflineLeases(
     if (lease.kind === "physical") {
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
       if (serialOnline) {
-        if (lease.firstSeenOfflineAtMs !== null) {
+        if (lease.firstSeenOfflineAtMs !== null && lease.firstSeenOfflineAtMs !== undefined) {
           lease.firstSeenOfflineAtMs = null;
           mutated = true;
         }
         continue;
       }
-      if (!adbDevicesOk) {
+      if (leasePlatform === "ios" ? !devicectlListOk : !adbDevicesOk) {
+        continue;
+      }
+    } else if (leasePlatform === "ios") {
+      const simOnline = Boolean(
+        lease.serial && (onlineSimSerials.has(lease.serial) || onlineSerials.has(lease.serial)),
+      );
+      if (simOnline) {
+        if (lease.firstSeenOfflineAtMs !== null && lease.firstSeenOfflineAtMs !== undefined) {
+          lease.firstSeenOfflineAtMs = null;
+          mutated = true;
+        }
+        continue;
+      }
+      if (!simctlListOk) {
         continue;
       }
     } else {
       const runningForAvd = lease.avd
-        ? (inventory.running || []).find((d) => d.kind === "emulator" && d.avd === lease.avd)
+        ? (inventory.running || []).find(
+            (d) =>
+              d.kind === "emulator" &&
+              (d.platform || "android") === "android" &&
+              d.avd === lease.avd,
+          )
         : null;
       const runningForSerial = lease.serial
-        ? (inventory.running || []).find((d) => d.kind === "emulator" && d.serial === lease.serial)
+        ? (inventory.running || []).find(
+            (d) =>
+              d.kind === "emulator" &&
+              (d.platform || "android") === "android" &&
+              d.serial === lease.serial,
+          )
         : null;
       const serialTakenByOtherAvd = Boolean(
         lease.avd &&
@@ -1338,7 +1444,7 @@ export function reconcileOfflineLeases(
             runningForSerial?.avd === lease.avd),
       );
       if (avdOnline || serialOnline) {
-        if (lease.firstSeenOfflineAtMs !== null) {
+        if (lease.firstSeenOfflineAtMs !== null && lease.firstSeenOfflineAtMs !== undefined) {
           lease.firstSeenOfflineAtMs = null;
           mutated = true;
         }
@@ -1353,18 +1459,64 @@ export function reconcileOfflineLeases(
       continue;
     }
 
-    if (lease.sessionId === callerSessionId) {
-      if (lease.kind === "emulator" && lease.avd && !lease.serial) {
-        continue;
-      }
-      delete state.leases[deviceKey];
-      mutated = true;
+    // Preserve active lease with serial: null from a failed owner restart (firstSeenOfflineAtMs === null)
+    if (
+      lease.sessionId === callerSessionId &&
+      lease.kind === "emulator" &&
+      lease.avd &&
+      !lease.serial &&
+      (lease.firstSeenOfflineAtMs === null || lease.firstSeenOfflineAtMs === undefined)
+    ) {
       continue;
     }
-    if (!lease.firstSeenOfflineAtMs) {
+
+    // Clear stale Android emulator serial immediately upon confirmed offline detection
+    if (
+      lease.kind === "emulator" &&
+      leasePlatform === "android" &&
+      lease.serial !== null &&
+      lease.serial !== undefined
+    ) {
+      lease.serial = null;
+      mutated = true;
+    }
+
+    if (lease.firstSeenOfflineAtMs === null || lease.firstSeenOfflineAtMs === undefined) {
       lease.firstSeenOfflineAtMs = now;
       mutated = true;
-    } else if (now - lease.firstSeenOfflineAtMs >= graceMs) {
+    }
+
+    const graceMs =
+      lease.kind === "physical"
+        ? (state.config?.physicalOfflineGraceMs ?? 15_000)
+        : (state.config?.offlineGraceMs ?? 45_000);
+    const expiresAtMs =
+      typeof lease.expiresAtMs === "number" && Number.isFinite(lease.expiresAtMs)
+        ? lease.expiresAtMs
+        : Infinity;
+    const recoveryDeadlineMs = Math.min(expiresAtMs, lease.firstSeenOfflineAtMs + graceMs);
+
+    if (now >= recoveryDeadlineMs) {
+      if (lease.kind === "physical") {
+        if (
+          !state.disconnectedPhysicalLeases ||
+          typeof state.disconnectedPhysicalLeases !== "object"
+        ) {
+          state.disconnectedPhysicalLeases = {};
+        }
+        state.disconnectedPhysicalLeases[lease.leaseId] = {
+          leaseId: lease.leaseId,
+          sessionId: lease.sessionId,
+          serial: lease.serial,
+          platform: leasePlatform,
+          profile: lease.profile || null,
+          disconnectedAtMs: lease.firstSeenOfflineAtMs,
+          expiresAtMs:
+            typeof lease.expiresAtMs === "number" && Number.isFinite(lease.expiresAtMs)
+              ? lease.expiresAtMs
+              : now + (state.config?.defaultTtlSec ?? 600) * 1000,
+        };
+      }
       delete state.leases[deviceKey];
       mutated = true;
     }
@@ -1556,6 +1708,17 @@ export function withStateTransaction(stateDir, fn, options = {}) {
   );
 }
 
+export function normalizeDeviceType(type) {
+  if (!type) return "";
+  const t = String(type).trim().toLowerCase();
+  if (t === "wear" || t === "wearos" || t === "watchos") return "watch";
+  if (t === "iphone") return "phone";
+  if (t === "ipad") return "tablet";
+  if (t === "appletv") return "tv";
+  if (t === "vision" || t === "visionos") return "xr";
+  return t;
+}
+
 export function normalizeApiLevel(spec) {
   if (!spec) return null;
   const s = String(spec).trim();
@@ -1597,20 +1760,90 @@ export function matchesApiSpec(deviceApiLevel, apiSpec) {
   return exactNum !== null ? devNum === exactNum : false;
 }
 
+export function parseOsVersionNumber(osStr) {
+  if (!osStr) return null;
+  const m = String(osStr).match(/(\d+(?:\.\d+)?)/);
+  return m ? Number(m[1]) : null;
+}
+
+export function matchesOsSpec(deviceOsVersion, osSpec) {
+  if (!osSpec) return true;
+  if (!deviceOsVersion || deviceOsVersion === "unknown") return false;
+  const spec = String(osSpec).trim().replace(/^[A-Za-z]+\s*/i, "");
+  const devNum = parseOsVersionNumber(deviceOsVersion);
+  if (devNum === null) {
+    return String(deviceOsVersion).toLowerCase() === String(osSpec).trim().toLowerCase();
+  }
+  const rangeMatch = spec.match(/^(\d+(?:\.\d+)?)\.\.(\d+(?:\.\d+)?)$/);
+  if (rangeMatch) {
+    const min = Number(rangeMatch[1]);
+    const max = Number(rangeMatch[2]);
+    const effectiveMax = rangeMatch[2].includes(".") ? max : max + 0.9999;
+    return devNum >= min && devNum <= effectiveMax;
+  }
+  const cmpMatch = spec.match(/^(>=|<=|>|<|=)\s*(\d+(?:\.\d+)?)$/);
+  if (cmpMatch) {
+    const op = cmpMatch[1];
+    const rawTarget = cmpMatch[2];
+    const target = Number(rawTarget);
+    if (op === ">=") return devNum >= target;
+    if (op === "<=") return rawTarget.includes(".") ? devNum <= target : devNum < target + 1;
+    if (op === ">") return rawTarget.includes(".") ? devNum > target : devNum >= target + 1;
+    if (op === "<") return devNum < target;
+    return rawTarget.includes(".") ? Math.abs(devNum - target) < 1e-6 : Math.floor(devNum) === target;
+  }
+  const exactMatch = spec.match(/^(\d+(?:\.\d+)?)$/);
+  if (exactMatch) {
+    const rawTarget = exactMatch[1];
+    const target = Number(rawTarget);
+    if (rawTarget.includes(".")) {
+      return Math.abs(devNum - target) < 1e-6;
+    }
+    return Math.floor(devNum) === target;
+  }
+  return false;
+}
+
 export function matchesProfile(device, req = {}) {
-  const requestedKind = req.kind || (req.serial && !req.serial.startsWith("emulator-") ? "any" : "emulator");
+  const devPlatform = device.platform || "android";
+  if (req.platform && req.platform !== "any" && devPlatform !== req.platform) {
+    return false;
+  }
+  const requestedKind =
+    req.kind ||
+    (req.serial && !req.serial.startsWith("emulator-") && !req.udid ? "any" : "emulator");
   if (requestedKind !== "any" && device.kind !== requestedKind) {
     return false;
   }
-  if (req.avd && device.avd !== req.avd) {
-    return false;
+  if (req.udid) {
+    const wantUdid = String(req.udid).trim().toLowerCase();
+    const devUdid = String(device.udid || device.serial || "").trim().toLowerCase();
+    const devAvd = String(device.avd || "").trim().toLowerCase();
+    if (devUdid !== wantUdid && devAvd !== wantUdid) {
+      return false;
+    }
   }
-  if (req.serial && device.serial !== req.serial) {
-    return false;
+  if (req.avd) {
+    if (devPlatform === "ios") {
+      const wantAvd = String(req.avd).trim().toLowerCase();
+      const devAvd = String(device.avd || "").trim().toLowerCase();
+      const devUdid = String(device.udid || device.serial || "").trim().toLowerCase();
+      const devTypeId = String(device.profile?.deviceTypeIdentifier || "").trim().toLowerCase();
+      if (devAvd !== wantAvd && devUdid !== wantAvd && devTypeId !== wantAvd) {
+        return false;
+      }
+    } else if (device.avd !== req.avd) {
+      return false;
+    }
+  }
+  if (req.serial) {
+    if (device.serial !== req.serial && device.udid !== req.serial) {
+      return false;
+    }
   }
   if (req.deviceType) {
-    const want = req.deviceType.toLowerCase();
-    const actual = (device.profile?.deviceType || "").toLowerCase();
+    const want = normalizeDeviceType(req.deviceType);
+    const actual = normalizeDeviceType(device.profile?.deviceType || "");
     if (actual !== want) {
       const resizableCompatible = ["phone", "foldable", "tablet", "desktop"].includes(want);
       if (!(actual === "resizable" && resizableCompatible)) {
@@ -1618,8 +1851,23 @@ export function matchesProfile(device, req = {}) {
       }
     }
   }
-  if (req.apiSpec && !matchesApiSpec(device.profile?.apiLevel, req.apiSpec)) {
-    return false;
+  if (req.apiSpec) {
+    if (devPlatform === "ios") {
+      if (!matchesOsSpec(device.profile?.osVersion || device.profile?.apiLevel, req.apiSpec)) {
+        return false;
+      }
+    } else if (!matchesApiSpec(device.profile?.apiLevel, req.apiSpec)) {
+      return false;
+    }
+  }
+  if (req.osSpec) {
+    if (devPlatform === "ios") {
+      if (!matchesOsSpec(device.profile?.osVersion || device.profile?.apiLevel, req.osSpec)) {
+        return false;
+      }
+    } else if (!matchesApiSpec(device.profile?.apiLevel, req.osSpec)) {
+      return false;
+    }
   }
   if (req.services) {
     if ((device.profile?.services || "").toLowerCase() !== req.services.toLowerCase()) {
@@ -1674,17 +1922,34 @@ export function computeEffectiveMaxEmulators(config = DEFAULT_CONFIG, host = {})
   return Math.max(1, Math.min(6, Math.min(byRam, byCpu)));
 }
 
+export function computeEffectiveMaxSimulators(config = DEFAULT_CONFIG, host = {}) {
+  const envCap = process.env.ATC_MAX_SIMULATORS;
+  if (envCap && /^\d+$/.test(envCap.trim())) {
+    return Math.max(1, Number(envCap.trim()));
+  }
+  const raw = config.maxRunningSimulators ?? DEFAULT_CONFIG.maxRunningSimulators;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw >= 1) {
+    return raw;
+  }
+  const totalRamGb = (host.totalRamMb || Math.round(os.totalmem() / (1024 * 1024))) / 1024;
+  const cpuCores = host.cpuCores || os.availableParallelism();
+  const reserveGb = Math.max(6, totalRamGb * 0.3);
+  const byRam = Math.floor((totalRamGb - reserveGb) / 2.0);
+  const byCpu = Math.floor(cpuCores / 2);
+  return Math.max(1, Math.min(8, Math.min(byRam, byCpu)));
+}
+
 export function computeUsedEmulatorSlots(state, inventory = {}) {
   const runningOrStopping = new Set();
   const serialToLeasedAvd = new Map();
   for (const lease of Object.values(state.leases || {})) {
-    if (lease.kind === "emulator" && lease.serial && lease.avd) {
+    if ((lease.platform || "android") === "android" && lease.kind === "emulator" && lease.serial && lease.avd) {
       serialToLeasedAvd.set(lease.serial, lease.avd);
     }
   }
   const inventoryEmulatorSerials = new Set();
   for (const dev of inventory.running || []) {
-    if (dev.kind === "emulator") {
+    if ((dev.platform || "android") === "android" && dev.kind === "emulator") {
       if (dev.serial) {
         inventoryEmulatorSerials.add(dev.serial);
       }
@@ -1696,6 +1961,7 @@ export function computeUsedEmulatorSlots(state, inventory = {}) {
   }
   for (const dev of inventory.offline || []) {
     if (
+      (dev.platform || "android") === "android" &&
       dev.kind === "emulator" &&
       (dev.hasLockFiles ||
         (inventory.avdHome && dev.avd && avdHasRuntimeLockFiles(dev.avd, inventory.avdHome)))
@@ -1708,6 +1974,7 @@ export function computeUsedEmulatorSlots(state, inventory = {}) {
   }
   for (const lease of Object.values(state.leases || {})) {
     if (
+      (lease.platform || "android") === "android" &&
       lease.kind === "emulator" &&
       (lease.state === "stopping" || lease.state === "active")
     ) {
@@ -1719,12 +1986,49 @@ export function computeUsedEmulatorSlots(state, inventory = {}) {
     }
   }
   let startingExtra = 0;
-  for (const lease of Object.values(state.leases)) {
-    if (lease.kind === "emulator" && lease.state === "starting") {
+  for (const lease of Object.values(state.leases || {})) {
+    if ((lease.platform || "android") === "android" && lease.kind === "emulator" && lease.state === "starting") {
       const avdAlreadyCounted = lease.avd && runningOrStopping.has(lease.avd);
       const replacingAlreadyCounted =
         lease.replacingAvd && runningOrStopping.has(lease.replacingAvd);
       if (!avdAlreadyCounted && !replacingAlreadyCounted) {
+        startingExtra += 1;
+      }
+    }
+  }
+  return runningOrStopping.size + startingExtra;
+}
+
+export function computeUsedSimulatorSlots(state, inventory = {}) {
+  const runningOrStopping = new Set();
+  for (const dev of inventory.running || []) {
+    if ((dev.platform || "android") === "ios" && dev.kind === "emulator") {
+      const key = dev.udid || dev.serial || dev.avd || dev.deviceKey;
+      if (key) {
+        runningOrStopping.add(key);
+      }
+    }
+  }
+  for (const lease of Object.values(state.leases || {})) {
+    if (
+      (lease.platform || "android") === "ios" &&
+      lease.kind === "emulator" &&
+      (lease.state === "stopping" || lease.state === "active")
+    ) {
+      const key = lease.udid || lease.serial || lease.avd || lease.deviceKey;
+      if (key) {
+        runningOrStopping.add(key);
+      }
+    }
+  }
+  let startingExtra = 0;
+  for (const lease of Object.values(state.leases || {})) {
+    if ((lease.platform || "android") === "ios" && lease.kind === "emulator" && lease.state === "starting") {
+      const key = lease.udid || lease.serial || lease.avd || lease.deviceKey;
+      const alreadyCounted = key && runningOrStopping.has(key);
+      const replacingAlreadyCounted =
+        lease.replacingAvd && runningOrStopping.has(lease.replacingAvd);
+      if (!alreadyCounted && !replacingAlreadyCounted) {
         startingExtra += 1;
       }
     }
@@ -1747,8 +2051,10 @@ export function canJumpAhead(candidateTicket, earlierTicket, targetDevice, now, 
     !candidateTicket.requestedProfile?.wipeData &&
     !candidateTicket.requestedProfile?.coldBoot;
   const earlierMatchesWarm = matchesProfile(targetDevice, {
+    platform: earlierTicket.requestedPlatform,
     kind: earlierTicket.requestedKind,
     avd: earlierTicket.requestedAvd,
+    udid: earlierTicket.requestedUdid,
     serial: earlierTicket.requestedSerial,
     ...earlierTicket.requestedProfile,
   });

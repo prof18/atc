@@ -6,16 +6,21 @@ export const MCP_TOOLS = [
   {
     name: "atc_claim",
     description:
-      "Claim an exclusive Android emulator or physical device lease by hardware/OS profile, snapshot/wipe state, and host RAM/disk budget.",
+      "Claim an exclusive Android emulator, iOS Simulator, or physical device lease by hardware/OS profile, snapshot/wipe state, and host RAM/disk budget.",
     inputSchema: {
       type: "object",
       properties: {
-        type: { type: "string", description: "Form factor: phone, tablet, foldable, desktop, wear, xr, tv, automotive, resizable" },
-        api: { type: "string", description: "API spec: e.g. 36, >=35, 34..36" },
+        platform: { type: "string", enum: ["android", "ios"], description: "Target platform: android or ios" },
+        ios: { type: "boolean", description: "Shorthand for platform: ios" },
+        android: { type: "boolean", description: "Shorthand for platform: android" },
+        type: { type: "string", description: "Form factor: phone, tablet, foldable, desktop, watch (alias: wear), xr, tv, automotive, resizable" },
+        api: { type: "string", description: "Android API spec: e.g. 36, >=35, 34..36" },
+        os: { type: "string", description: "OS version spec: e.g. 18.2, >=18.0, 17.5..18.2 (or Android API level)" },
         services: { type: "string", enum: ["play", "google_apis", "aosp"] },
-        play: { type: "boolean", description: "Require Google Play Store" },
+        play: { type: "boolean", description: "Require Google Play Store (Android)" },
         abi: { type: "string" },
-        avd: { type: "string" },
+        avd: { type: "string", description: "Android AVD name or iOS Simulator name/UDID" },
+        udid: { type: "string", description: "iOS Simulator or physical device UDID" },
         serial: { type: "string" },
         kind: { type: "string", enum: ["emulator", "physical", "any"] },
         createIfMissing: { type: "boolean" },
@@ -36,11 +41,14 @@ export const MCP_TOOLS = [
   },
   {
     name: "atc_free",
-    description: "Release an active device lease with optional snapshot-save, snapshot-load, or emulator shutdown.",
+    description: "Release an active device lease with optional snapshot-save, snapshot-load, or emulator/simulator shutdown.",
     inputSchema: {
       type: "object",
       properties: {
-        target: { type: "string", description: "Lease ID, serial, or AVD name (omit to free all leases owned by this session)" },
+        target: { type: "string", description: "Lease ID, serial/UDID, or AVD/Simulator name (omit to free all leases owned by this session)" },
+        platform: { type: "string", enum: ["android", "ios"], description: "Optional platform filter (android or ios) when freeing without target" },
+        ios: { type: "boolean", description: "Shorthand for platform: ios" },
+        android: { type: "boolean", description: "Shorthand for platform: android" },
         snapshotSave: { type: "string" },
         snapshotLoad: { type: "string" },
         stop: { type: "boolean" },
@@ -56,6 +64,9 @@ export const MCP_TOOLS = [
       type: "object",
       properties: {
         target: { type: "string" },
+        platform: { type: "string", enum: ["android", "ios"], description: "Optional platform filter (android or ios) when renewing in a dual-lease KMP session" },
+        ios: { type: "boolean", description: "Shorthand for platform: ios" },
+        android: { type: "boolean", description: "Shorthand for platform: android" },
         ttlSec: { type: "number" },
         session: { type: "string", description: "Optional explicit session ID override" },
       },
@@ -63,13 +74,17 @@ export const MCP_TOOLS = [
   },
   {
     name: "atc_snapshot",
-    description: "List, save, load, or delete QEMU snapshots on a leased emulator.",
+    description: "List, save, load, or delete QEMU or APFS Copy-on-Write snapshots on a leased emulator or iOS Simulator.",
     inputSchema: {
       type: "object",
       properties: {
         action: { type: "string", enum: ["list", "save", "load", "delete"] },
         name: { type: "string" },
+        platform: { type: "string", enum: ["android", "ios"] },
+        ios: { type: "boolean" },
+        android: { type: "boolean" },
         avd: { type: "string" },
+        udid: { type: "string" },
         serial: { type: "string" },
         force: { type: "boolean" },
         session: { type: "string", description: "Optional explicit session ID override" },
@@ -79,12 +94,16 @@ export const MCP_TOOLS = [
   },
   {
     name: "atc_status",
-    description: "Inspect 3-tier fleet capacity (running, offline, creatable), host RAM/disk budget, active leases, and wait queue.",
+    description: "Inspect 3-tier fleet capacity (running, offline, creatable), host RAM/disk budget, active leases, and wait queue across Android and iOS.",
     inputSchema: {
       type: "object",
       properties: {
+        platform: { type: "string", enum: ["android", "ios"] },
+        ios: { type: "boolean" },
+        android: { type: "boolean" },
         type: { type: "string" },
         api: { type: "string" },
+        os: { type: "string" },
         services: { type: "string" },
         play: { type: "boolean" },
       },
@@ -93,7 +112,7 @@ export const MCP_TOOLS = [
   {
     name: "atc_guide",
     description:
-      "Read built-in Android Traffic Control (atc) guides on workflow, profile matching, snapshots, multi-agent coordination, and troubleshooting traps.",
+      "Read built-in Agent Traffic Control (atc) guides on workflow, profile matching, snapshots, multi-agent coordination, and troubleshooting traps.",
     inputSchema: {
       type: "object",
       properties: {
@@ -161,7 +180,7 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
         capabilities: { tools: {} },
         serverInfo: {
           name: "android-traffic-control",
-          version: "1.1.0",
+          version: "2.0.0",
         },
       },
     };

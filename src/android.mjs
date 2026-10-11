@@ -47,7 +47,7 @@ export function inferDeviceType(deviceName = "", sysDir = "", tagId = "") {
     combined.includes("wear") ||
     /(?:^|[\s,/_\\-])watch(?:$|[\s,/_\\-])/.test(combined)
   ) {
-    return "wear";
+    return "watch";
   }
   if (combined.includes("tv") || combined.includes("atv")) return "tv";
   if (/(?:^|[\s,/_\\-])(automotive|auto|car)(?:$|[\s,/_\\-])/.test(combined)) {
@@ -152,6 +152,7 @@ export function readLocalAvdMetadata(
   }
 
   return {
+    platform: "android",
     avd: avdId,
     avdPath,
     exists: fs.existsSync(avdPath) || fs.existsSync(iniPath),
@@ -399,6 +400,7 @@ export function parseCreatableProfilesOutput(stdout) {
     const deviceType = inferDeviceType(deviceName, line, line);
 
     profiles.push({
+      platform: "android",
       kind: "emulator",
       deviceName,
       profile: {
@@ -508,12 +510,20 @@ export function checkResourceAdmission(
 ) {
   if (force) return { ok: true };
   const cfg = state.config || DEFAULT_CONFIG;
-  const overheadMb = cfg.qemuOverheadRamMb ?? 1024;
+  const candidatePlatform = candidate.platform || "android";
+  const overheadMb =
+    candidatePlatform === "ios"
+      ? (cfg.simOverheadRamMb ?? 1280)
+      : (cfg.qemuOverheadRamMb ?? 1024);
   const neededRamMb =
-    typeof candidate.ramSizeMb === "number" && candidate.ramSizeMb > 0
-      ? candidate.ramSizeMb + overheadMb
-      : candidate.requiredRamMb || 2048 + overheadMb;
-  const neededDiskMb = wipeOrCreate ? candidate.dataDiskMb || 6656 : candidate.ramSizeMb || 2048;
+    candidatePlatform === "ios"
+      ? candidate.requiredRamMb || overheadMb
+      : typeof candidate.ramSizeMb === "number" && candidate.ramSizeMb > 0
+        ? candidate.ramSizeMb + overheadMb
+        : candidate.requiredRamMb || 2048 + overheadMb;
+  const neededDiskMb = wipeOrCreate
+    ? candidate.dataDiskMb || (candidatePlatform === "ios" ? 2048 : 6656)
+    : candidate.ramSizeMb || (candidatePlatform === "ios" ? 1024 : 2048);
 
   const candidateDiskInfo =
     typeof candidate.freeDiskMb === "number"
@@ -523,25 +533,51 @@ export function checkResourceAdmission(
         : { freeDiskMb: host?.freeDiskMb ?? 16384, fsDev: candidate.fsDev ?? host?.fsDev ?? null };
   const candidateFsKey = candidateDiskInfo.fsDev || candidate.avdPath || "default";
 
-  const onlineAvds = new Set(
-    (inventory?.running || []).filter((d) => d.kind === "emulator").map((d) => d.avd),
-  );
+  const onlineAvds = new Set();
+  for (const d of inventory?.running || []) {
+    if (d.kind === "emulator") {
+      if (d.avd) onlineAvds.add(d.avd);
+      if (d.udid) onlineAvds.add(d.udid);
+      if (d.deviceKey) onlineAvds.add(d.deviceKey);
+    }
+  }
   let unaccountedRamMb = 0;
   let unaccountedDiskMb = 0;
   for (const lease of Object.values(state.leases || {})) {
-    if (lease.kind !== "emulator" || lease.avd === candidate.avd) continue;
-    const isStarting = lease.state === "starting" && !onlineAvds.has(lease.avd);
+    if (lease.kind !== "emulator") continue;
+    if (
+      (candidate.deviceKey && lease.deviceKey === candidate.deviceKey) ||
+      (candidate.avd && lease.avd === candidate.avd && (lease.platform || "android") === candidatePlatform)
+    ) {
+      continue;
+    }
+    const leaseOnline =
+      (lease.avd && onlineAvds.has(lease.avd)) ||
+      (lease.udid && onlineAvds.has(lease.udid)) ||
+      (lease.deviceKey && onlineAvds.has(lease.deviceKey));
+    const isStarting = lease.state === "starting" && !leaseOnline;
     const isRecentlyActivated =
       lease.state === "active" &&
-      !onlineAvds.has(lease.avd) &&
+      lease.firstSeenOfflineAtMs == null &&
+      !leaseOnline &&
       typeof lease.activatedAtMs === "number" &&
       now - lease.activatedAtMs < 30_000;
+    const leaseOverheadMb =
+      (lease.platform || "android") === "ios"
+        ? (cfg.simOverheadRamMb ?? 1280)
+        : (cfg.qemuOverheadRamMb ?? 1024);
     if (isStarting || isRecentlyActivated) {
-      unaccountedRamMb += lease.requiredRamMb || 2048 + overheadMb;
+      unaccountedRamMb +=
+        lease.requiredRamMb ||
+        ((lease.platform || "android") === "ios" ? leaseOverheadMb : 2048 + leaseOverheadMb);
     }
     const leaseFsKey = lease.fsDev || host?.fsDev || lease.avdPath || "default";
     if (leaseFsKey === candidateFsKey) {
-      if (isStarting && typeof lease.requiredDiskMb === "number" && lease.requiredDiskMb > 0) {
+      if (
+        (isStarting || lease.state === "stopping") &&
+        typeof lease.requiredDiskMb === "number" &&
+        lease.requiredDiskMb > 0
+      ) {
         unaccountedDiskMb += lease.requiredDiskMb;
       } else if (
         typeof lease.pendingSnapshotDiskMb === "number" &&
@@ -552,18 +588,29 @@ export function checkResourceAdmission(
     }
   }
 
+  const replacingOverheadMb =
+    replacingAvd && (replacingAvd.platform || "android") === "ios"
+      ? (cfg.simOverheadRamMb ?? 1280)
+      : (cfg.qemuOverheadRamMb ?? 1024);
   const replacingCreditMb = replacingAvd
-    ? typeof replacingAvd.ramSizeMb === "number" && replacingAvd.ramSizeMb > 0
-      ? replacingAvd.ramSizeMb + overheadMb
-      : replacingAvd.requiredRamMb || 2048 + overheadMb
+    ? (replacingAvd.platform || "android") === "ios"
+      ? replacingAvd.requiredRamMb || replacingOverheadMb
+      : typeof replacingAvd.ramSizeMb === "number" && replacingAvd.ramSizeMb > 0
+        ? replacingAvd.ramSizeMb + replacingOverheadMb
+        : replacingAvd.requiredRamMb || 2048 + replacingOverheadMb
     : 0;
   const projectedAvailableRamMb =
     (host.availableRamMb ?? 4096) + replacingCreditMb - unaccountedRamMb;
 
+  const targetLabel =
+    candidatePlatform === "ios"
+      ? `Simulator "${candidate.avd || candidate.udid}"`
+      : `AVD "${candidate.avd}"`;
+
   if (projectedAvailableRamMb < neededRamMb + (cfg.minFreeRamMb ?? 2048)) {
     throw new ResourceError(
       5,
-      `Insufficient host RAM for AVD "${candidate.avd}": needs ${neededRamMb}MB (+${cfg.minFreeRamMb ?? 2048}MB reserve), projected available is ${projectedAvailableRamMb}MB. Pass --force to bypass.`,
+      `Insufficient host RAM for ${targetLabel}: needs ${neededRamMb}MB (+${cfg.minFreeRamMb ?? 2048}MB reserve), projected available is ${projectedAvailableRamMb}MB. Pass --force to bypass.`,
     );
   }
 
@@ -571,7 +618,7 @@ export function checkResourceAdmission(
   if (projectedFreeDiskMb < neededDiskMb + (cfg.minFreeDiskMb ?? 2048)) {
     throw new ResourceError(
       5,
-      `Insufficient disk space for AVD "${candidate.avd}": needs ${neededDiskMb}MB (+${cfg.minFreeDiskMb ?? 2048}MB reserve), only ${projectedFreeDiskMb}MB free. Pass --force to bypass.`,
+      `Insufficient disk space for ${targetLabel}: needs ${neededDiskMb}MB (+${cfg.minFreeDiskMb ?? 2048}MB reserve), only ${projectedFreeDiskMb}MB free. Pass --force to bypass.`,
     );
   }
 
@@ -618,6 +665,7 @@ export function discoverFleet({
           const avdId = entry.slice(0, -4);
           knownAvds.set(avdId, {
             ...readLocalAvdMetadata(avdId, avdHome, cfg, livenessCheck),
+            platform: "android",
             deviceKey: `avd:${avdId}`,
             kind: "emulator",
             online: false,
@@ -635,11 +683,14 @@ export function discoverFleet({
   const emuListRes = runner("android", ["emulator", "list", "--long"], { timeoutMs: 8000 });
   notifyProgress();
   let emulatorListOk = emuListRes.status === 0;
+  let emulatorListErrorCode = emuListRes.error?.code || null;
+  let emulatorListStderr = `${emuListRes.stderr || ""} ${emuListRes.stdout || ""}`.trim();
   const onlineSerials = new Set();
   if (emulatorListOk && emuListRes.stdout) {
     for (const item of parseAndroidEmulatorListOutput(emuListRes.stdout)) {
       const existing = knownAvds.get(item.avd) || {
         ...readLocalAvdMetadata(item.avd, avdHome, cfg, livenessCheck),
+        platform: "android",
         deviceKey: `avd:${item.avd}`,
         kind: "emulator",
       };
@@ -664,6 +715,7 @@ export function discoverFleet({
         if (!knownAvds.has(avdId)) {
           knownAvds.set(avdId, {
             ...readLocalAvdMetadata(avdId, avdHome, cfg, livenessCheck),
+            platform: "android",
             deviceKey: `avd:${avdId}`,
             kind: "emulator",
             online: false,
@@ -671,6 +723,8 @@ export function discoverFleet({
           });
         }
       }
+    } else if (sdkListRes.error?.code) {
+      emulatorListErrorCode = emulatorListErrorCode || sdkListRes.error.code;
     }
   }
 
@@ -680,6 +734,8 @@ export function discoverFleet({
   const adbRes = runner("adb", ["devices"], { timeoutMs: 8000 });
   notifyProgress();
   const adbDevicesOk = adbRes.status === 0;
+  const adbDevicesErrorCode = adbRes.error?.code || null;
+  const adbDevicesStderr = `${adbRes.stderr || ""} ${adbRes.stdout || ""}`.trim();
   if (adbDevicesOk && adbRes.stdout) {
     for (const dev of parseAdbDevicesOutput(adbRes.stdout)) {
       if (dev.serial) onlineSerials.add(dev.serial);
@@ -698,6 +754,7 @@ export function discoverFleet({
         if (avdId && avdId !== "OK") {
           const existing = knownAvds.get(avdId) || {
             ...readLocalAvdMetadata(avdId, avdHome, cfg, livenessCheck),
+            platform: "android",
             deviceKey: `avd:${avdId}`,
             kind: "emulator",
           };
@@ -706,6 +763,7 @@ export function discoverFleet({
           knownAvds.set(avdId, existing);
         } else {
           unmappedEmulators.push({
+            platform: "android",
             deviceKey: `serial:${dev.serial}`,
             kind: "emulator",
             avd: null,
@@ -745,6 +803,7 @@ export function discoverFleet({
           (props["ro.atrace.core.services"]?.includes("com.google.android.gms") ? "gms" : "");
         const hasProps = Object.keys(props).length > 0;
         physicalDevices.push({
+          platform: "android",
           deviceKey: `serial:${dev.serial}`,
           kind: "physical",
           avd: null,
@@ -791,13 +850,18 @@ export function discoverFleet({
     host,
     avdHome,
     discoveredAtMs,
+    queriedPlatforms: ["android"],
     running,
     offline,
     creatable,
     onlineSerials: Array.from(onlineSerials),
     probes: {
       emulatorListOk,
+      emulatorListErrorCode,
+      emulatorListStderr,
       adbDevicesOk,
+      adbDevicesErrorCode,
+      adbDevicesStderr,
     },
   };
 }

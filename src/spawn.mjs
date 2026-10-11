@@ -624,16 +624,116 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
       }
     }
   }
+
+  let nextArgs = [...args];
+  if (
+    base === "simctl" ||
+    (base === "xcrun" && String(nextArgs[0] || "").toLowerCase() === "simctl")
+  ) {
+    const simctlOffset = base === "xcrun" ? 1 : 0;
+    let subIdx = simctlOffset;
+    while (subIdx < nextArgs.length && String(nextArgs[subIdx]).startsWith("-")) {
+      const flag = String(nextArgs[subIdx]);
+      if ((flag === "--set" || flag === "-s") && subIdx + 1 < nextArgs.length) {
+        subIdx += 2;
+      } else {
+        subIdx += 1;
+      }
+    }
+    const simSub = String(nextArgs[subIdx] || "").toLowerCase();
+    if (["boot", "shutdown", "erase", "create", "delete", "clone"].includes(simSub)) {
+      throw new Error(
+        `Direct "xcrun simctl ${simSub}" is disabled under ATC. Use "atc claim --ios" or "atc free --stop" instead.`,
+      );
+    }
+    const readOnlySimSubs = new Set(["list", "help", "diagnose", "getenv"]);
+    if (simSub && !readOnlySimSubs.has(simSub) && lease.serial) {
+      // Find first non-flag target argument after simSub
+      let targetIdx = subIdx + 1;
+      while (targetIdx < nextArgs.length && String(nextArgs[targetIdx]).startsWith("-")) {
+        targetIdx += 1;
+      }
+      if (targetIdx < nextArgs.length) {
+        const targetToken = String(nextArgs[targetIdx]);
+        if (targetToken.toLowerCase() === "booted") {
+          nextArgs[targetIdx] = lease.serial;
+        } else if (
+          /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(
+            targetToken,
+          ) &&
+          targetToken.toUpperCase() !== String(lease.serial).toUpperCase()
+        ) {
+          throw new Error(
+            `Conflicting device selector "${targetToken}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+          );
+        }
+      }
+    }
+  } else if (
+    base === "devicectl" ||
+    (base === "xcrun" && String(nextArgs[0] || "").toLowerCase() === "devicectl")
+  ) {
+    const devctlOffset = base === "xcrun" ? 1 : 0;
+    let subIdx = devctlOffset;
+    while (subIdx < nextArgs.length && String(nextArgs[subIdx]).startsWith("-")) {
+      subIdx += 1;
+    }
+    const devctlSub = String(nextArgs[subIdx] || "").toLowerCase();
+    let explicitDevice = null;
+    for (let i = devctlOffset; i < nextArgs.length; i++) {
+      const a = String(nextArgs[i]);
+      if (a.startsWith("--device=")) {
+        explicitDevice = a.slice("--device=".length);
+        break;
+      }
+      if ((a === "--device" || a === "-d") && i + 1 < nextArgs.length) {
+        explicitDevice = String(nextArgs[i + 1]);
+        break;
+      }
+    }
+    const allowedIds = new Set(
+      [lease.serial, lease.udid, lease.coreDeviceId, lease.profile?.coreDeviceId]
+        .filter(Boolean)
+        .map((s) => String(s).toUpperCase()),
+    );
+    if (
+      explicitDevice &&
+      allowedIds.size > 0 &&
+      !allowedIds.has(explicitDevice.toUpperCase())
+    ) {
+      throw new Error(
+        `Conflicting device selector "${explicitDevice}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+      );
+    }
+    const isHelp = nextArgs.includes("--help") || nextArgs.includes("-h");
+    if (
+      !explicitDevice &&
+      !isHelp &&
+      lease.serial &&
+      (devctlSub === "device" || devctlSub === "manage")
+    ) {
+      nextArgs = [...nextArgs, "--device", String(lease.serial)];
+    }
+  }
+
+  const leasePlatform = lease.platform || "android";
   const env = {
     ...baseEnv,
     ...(useDefaultStandardPath && process.platform !== "win32"
       ? { PATH: "/usr/bin:/bin" }
       : {}),
-    ANDROID_SERIAL: lease.serial,
+    ...(leasePlatform === "ios"
+      ? {
+          ...(lease.kind === "emulator" ? { SIMULATOR_UDID: lease.serial } : {}),
+        }
+      : {
+          ANDROID_SERIAL: lease.serial,
+        }),
+    ATC_PLATFORM: leasePlatform,
+    ATC_DEVICE_SERIAL: lease.serial,
     ATC_LEASE_ID: lease.leaseId,
     ATC_SESSION_ID: sessionId,
   };
-  let nextArgs = [...args];
   if (base === "android" && androidParsed) {
     const hasDeviceFlag = nextArgs.some((a) => a === "--device" || a.startsWith("--device="));
     const isHelp = nextArgs.includes("--help") || nextArgs.includes("-h");
