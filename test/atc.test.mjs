@@ -727,7 +727,11 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "ruby -e 'system(*%w-adb shell input tap 1 1-)'",
     `"/opt/Android SDK (tools)/platform-tools/adb" shell getprop`,
     `"C:\\\\Program Files (x86)\\\\Android\\\\android-sdk\\\\platform-tools\\\\adb.exe" shell getprop`,
+    `"/tmp/s h" -c 'adb shell pm clear com.x'`,
     "node scripts/adb.js shell pm clear com.x",
+    "python3 scripts/adb.py shell pm clear com.x",
+    "perl scripts/adb.pl shell pm clear com.x",
+    "ruby scripts/adb.rb shell pm clear com.x",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
@@ -739,12 +743,16 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   for (const cmd of [
     `xargs "/opt/Android SDK/platform-tools/adb" kill-server </dev/null`,
     "perl -e 'qx!adb kill-server!'",
+    "python3 scripts/adb.py kill-server",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
   }
-  const atcRes = evaluateCommandGuard("node bin/atc.mjs free", opts);
+  const atcRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "linux" });
   assert.equal(atcRes.allowed, true);
   assert.match(atcRes.rewrittenCommand || "", /ATC_SESSION_ID=sess-unleased/);
+  const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
+  assert.equal(atcWinRes.allowed, true);
+  assert.match(atcWinRes.rewrittenCommand || "", /--session sess-unleased/);
 });
 
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {

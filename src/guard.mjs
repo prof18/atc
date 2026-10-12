@@ -1,12 +1,23 @@
 import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
+const TOOL_NAMES_RE_SRC =
+  "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
+const TOOL_EXEC_EXT_RE_SRC =
+  "(?:exe|bat|cmd|com|ps1|psm1|vbs|wsf|sh|bash|zsh|dash|ksh|fish|csh|tcsh|mjs|cjs|js|ts|mts|cts|py|pyw|pl|pm|rb|php|phar|lua|tcl|awk|sed|jar|run|bin|out|appimage)";
+const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
+const ATC_WIN_SESSION_RE = new RegExp(
+  `\\b(atc(?:\\.${TOOL_EXEC_EXT_RE_SRC})?["']?)(\\s+[A-Za-z0-9_-]+)`,
+  "i",
+);
 // Stricter than FAST_PATH_REGEX: the tool name must be a standalone token or executable basename
-// (`adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `bin/atc.mjs`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`),
+// (`adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `bin/atc.mjs`, `scripts/adb.py`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`),
 // not a directory segment or fragment of a longer word/identifier (`my-android-app/`, `atc.test.mjs`,
 // `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
-const STANDALONE_TOOL_REGEX =
-  /(?:(?<![A-Za-z0-9_.@-])(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd|com|ps1|sh|mjs|cjs|js)(?![A-Za-z0-9_]))?(?![A-Za-z0-9_.@/\\-])|(?:\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\s*([^\w\s])\s*(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd|com|ps1|sh|mjs|cjs|js))?(?=\s|\2))/i;
+const STANDALONE_TOOL_REGEX = new RegExp(
+  `(?:(?<![A-Za-z0-9_.@-])${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_]))?(?![A-Za-z0-9_.@/\\\\-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
+  "i",
+);
 const TRANSPARENT_WRAPPERS = new Set([
   "env",
   "command",
@@ -192,7 +203,7 @@ function extractExecutableBase(tok) {
   if (!tok || typeof tok !== "string") return "";
   const file = tok.split(/[\\/]/).pop() || "";
   if (!file || /[\s"'`();|&[\]{},<>]/.test(file)) return "";
-  return file.replace(/\.(?:exe|bat|cmd|com|ps1|sh|mjs|cjs|js)$/i, "").toLowerCase();
+  return file.replace(TOOL_EXEC_EXT_STRIP_RE, "").toLowerCase();
 }
 
 function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") {
@@ -1273,7 +1284,8 @@ export function parseSegment(segment, inheritedVars = {}) {
     }
   }
   const cmd = remaining[0] || "";
-  const baseCmd = extractExecutableBase(cmd);
+  const baseCmd =
+    extractExecutableBase(cmd) || (cmd.split(/[\\/]/).pop() || cmd).toLowerCase();
   const args = remaining.slice(1);
   return {
     raw: expandVariables(segment, allVars),
@@ -4608,7 +4620,7 @@ function rewriteCompoundCommand(
           );
         if (!hasSession) {
           finishLoopDepth();
-          return trimmed.replace(/\batc(\s+[A-Za-z0-9_-]+)/i, `atc$1 ${sessionFlags}`);
+          return trimmed.replace(ATC_WIN_SESSION_RE, `$1$2 ${sessionFlags}`);
         }
       }
       finishLoopDepth();
