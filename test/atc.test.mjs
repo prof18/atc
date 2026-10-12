@@ -721,6 +721,10 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     `node -e 'require("child_process").execSync("C:\\\\sdk\\\\platform-tools\\\\a\\"\\"db.exe shell pm clear com.x")'`,
     `node -e 'require("child_process").execSync("adb</dev/null shell input keyevent 82")'`,
     `node -e 'require("child_process").execSync("adb>/dev/null shell input keyevent 82")'`,
+    "perl -e 'qx!adb shell pm clear com.x!'",
+    "perl -e 'qx/adb shell pm clear com.x/'",
+    "ruby -e '%x+adb shell pm clear com.x+'",
+    "ruby -e 'system(*%w-adb shell input tap 1 1-)'",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }

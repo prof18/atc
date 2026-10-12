@@ -1,11 +1,12 @@
 import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
-// Stricter than FAST_PATH_REGEX: the tool name must be a standalone shell word or an executable path
-// (`adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `"adb shell"`, `adb</dev/null`), not a fragment of a longer
-// word such as `my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, or `atc@atc`.
+// Stricter than FAST_PATH_REGEX: the tool name must be a standalone token or executable basename
+// (`adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a
+// directory segment or fragment of a longer word/identifier (`my-android-app/`, `atc.test.mjs`,
+// `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
 const STANDALONE_TOOL_REGEX =
-  /(?:^|[\s"'`(;|&=/\\[{,<>])(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd))?(?=$|[\s"'`);|&\]}<>,])/i;
+  /(?:(?<![A-Za-z0-9_.@-])(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd)(?![A-Za-z0-9_]))?(?![A-Za-z0-9_.@/\\-])|(?:\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\s*([^\w\s])\s*(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd))?(?=\s|\2))/i;
 const TRANSPARENT_WRAPPERS = new Set([
   "env",
   "command",
@@ -187,13 +188,21 @@ function decodeShellEscapes(str) {
   );
 }
 
+function extractExecutableBase(tok) {
+  if (!tok || typeof tok !== "string") return "";
+  if (/[;`()[\]{}<>]/.test(tok)) return "";
+  const file = tok.split(/[\\/]/).pop() || "";
+  if (!file || /[\s"'`();|&[\]{},<>]/.test(file)) return "";
+  return file.replace(/\.(?:exe|bat|cmd|com|ps1|sh|mjs|cjs|js)$/i, "").toLowerCase();
+}
+
 function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") {
   const tokens = tokenizeSegment(
     String(expandedInner || "")
       .trimStart()
       .replace(LEADING_CONTROL_PREFIX_RE, ""),
   );
-  const cmd = tokens[0] ? path.basename(tokens[0], path.extname(tokens[0])).toLowerCase() : "";
+  const cmd = tokens[0] ? extractExecutableBase(tokens[0]) : "";
   const args = tokens.slice(1);
 
   if (cmd === "echo") {
@@ -1121,7 +1130,7 @@ export function parseSegment(segment, inheritedVars = {}) {
       idx++;
       continue;
     }
-    const base = path.basename(tok, path.extname(tok)).toLowerCase();
+    const base = extractExecutableBase(tok);
     if (base === "command" && (tokens[idx + 1] === "-v" || tokens[idx + 1] === "-V")) {
       break;
     }
@@ -1265,7 +1274,7 @@ export function parseSegment(segment, inheritedVars = {}) {
     }
   }
   const cmd = remaining[0] || "";
-  const baseCmd = path.basename(cmd, path.extname(cmd)).toLowerCase();
+  const baseCmd = extractExecutableBase(cmd);
   const args = remaining.slice(1);
   return {
     raw: expandVariables(segment, allVars),
@@ -2084,7 +2093,8 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   ) {
     const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
     const nestedRelIdx = args.slice(startSearchIdx).findIndex((a) => {
-      const b = path.basename(a, path.extname(a)).toLowerCase();
+      if (!a || /\s/.test(a)) return false;
+      const b = extractExecutableBase(a);
       return (
         [
           "atc",
@@ -2160,7 +2170,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
 function extractEmbeddedCommands(args) {
   const candidates = [];
-  const toolNames = new Set(["atc", "emulator", "adb", "android", "gradlew", "gradle"]);
+  const toolNames = new Set(TOOL_NAMES);
   for (const rawArg of args) {
     if (!rawArg || !matchesAndroidOrAtcText(rawArg)) continue;
     const arg = String(rawArg).replace(/\\(["'`\\])/g, "$1");
@@ -2177,7 +2187,7 @@ function extractEmbeddedCommands(args) {
       }
     }
     for (let i = 0; i < literals.length; i++) {
-      const base = path.basename(literals[i], path.extname(literals[i])).toLowerCase();
+      const base = extractExecutableBase(literals[i]);
       if (toolNames.has(base)) {
         const joined = literals
           .slice(i)
