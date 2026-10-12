@@ -2223,17 +2223,12 @@ export function consumePendingMcpHookSession(
       entry.pendingMcpCalls = livePending;
 
       if (explicitSession) {
-        let idx = livePending.findIndex(
+        const idx = livePending.findIndex(
           (item) =>
             item.sessionId === explicitSession &&
             item.toolName === normTool &&
             item.argsKey === argsKey,
         );
-        if (idx === -1) {
-          idx = livePending.findIndex(
-            (item) => item.toolName === normTool && item.argsKey === argsKey,
-          );
-        }
         if (idx !== -1) {
           livePending.splice(idx, 1);
           mutated = true;

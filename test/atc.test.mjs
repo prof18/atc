@@ -560,7 +560,17 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
     assert.deepEqual(JSON.parse(mcpFreeOtherReply.result.content[0].text).freed, []);
     assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].sessionId, "cp-1");
 
-    // An explicit session override in MCP toolArgs does not leave a stale pending record that poisons another chat's unforwarded call
+    // An explicit session override in MCP toolArgs neither records a stale pending entry nor consumes another chat's pending unforwarded call
+    handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-2",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: {},
+      }),
+      { ppid: process.pid }
+    );
     handlePreToolUseHook(
       dir,
       JSON.stringify({
@@ -582,16 +592,6 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
       sharedMcpOpts
     );
     assert.equal(explicitOverrideReply.result.isError, false);
-    handlePreToolUseHook(
-      dir,
-      JSON.stringify({
-        sessionId: "cp-2",
-        cwd: process.cwd(),
-        toolName: "atc-atc_free",
-        toolArgs: {},
-      }),
-      { ppid: process.pid }
-    );
     const postOverrideUnforwardedReply = handleMcpRequest(
       dir,
       {
