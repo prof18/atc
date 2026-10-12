@@ -801,8 +801,25 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "pnpm -C adb@2 exec adb kill-server",
     "sh <<'EOF'\na\\\ndb kill-server\nEOF",
     `node -e 'require("child_process").spawnSync(process.argv[2],process.argv.slice(3))' -- --title adb kill-server`,
+    "cat <<$'EOF'\nbody\nEOF\nadb kill-server",
+    'cat <<$"EOF"\nbody\nEOF\nadb kill-server',
+    "cat <<EOF\n$\\\n(adb kill-server)\nEOF",
+    "./adb-wrapper kill-server",
+    "./adb_wrapper kill-server",
+    "./my-adb kill-server",
+    "python3 scripts/adb-wrapper.py kill-server",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
+  }
+  for (const cmd of [
+    "cat <<$'EOF'\nbody\nEOF\nadb shell getprop",
+    'cat <<$"EOF"\nbody\nEOF\nadb shell getprop',
+    "cat <<EOF\n$\\\n(adb shell getprop)\nEOF",
+    "./adb-wrapper shell getprop",
+    "./adb_wrapper shell getprop",
+    "python3 scripts/adb-wrapper.py shell getprop",
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
   for (const cmd of [
     "perl -e 'print q!adb kill-server!'",
@@ -811,11 +828,23 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     `node -e 'process.stdout.write("ok")' # adb kill-server`,
     "cat <<'EOF'\na\\\ndb shell\nEOF",
     "cat <<EOF\na\\\ndb shell\nEOF",
+    "cat <<$'EOF'\nadb kill-server\nEOF",
+    'cat <<$"EOF"\nadb kill-server\nEOF',
     "tee /tmp/script <<EOF\na\\\ndb kill-server\nEOF",
     "tee /tmp/script <<EOF\nadb kill-server\nEOF",
+    `node -e 'console.log("android-app is cool")'`,
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, true, cmd);
   }
+  const wrapperLeasedRes = evaluateCommandGuard("./adb-wrapper shell getprop", {
+    ...leasedOpts,
+    platform: "linux",
+  });
+  assert.equal(wrapperLeasedRes.allowed, true);
+  assert.equal(
+    wrapperLeasedRes.rewrittenCommand,
+    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./adb-wrapper shell getprop",
+  );
   const heredocSubRes = evaluateCommandGuard(
     "cat <<EOF\n$(adb shell getprop ro.build.version.release)\nEOF",
     { ...leasedOpts, platform: "linux" },
@@ -823,6 +852,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   assert.equal(heredocSubRes.allowed, true);
   assert.equal(
     heredocSubRes.rewrittenCommand,
+    "cat <<EOF\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF",
+  );
+  const heredocContSubRes = evaluateCommandGuard(
+    "cat <<EOF\n$\\\n(adb shell getprop ro.build.version.release)\nEOF",
+    { ...leasedOpts, platform: "linux" },
+  );
+  assert.equal(heredocContSubRes.allowed, true);
+  assert.equal(
+    heredocContSubRes.rewrittenCommand,
     "cat <<EOF\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF",
   );
   const heredocSingleQuoteSubRes = evaluateCommandGuard(
