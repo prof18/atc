@@ -447,6 +447,8 @@ function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") 
   return "__atc_cmd_sub__";
 }
 
+const CMD_EXE_PREFIX_RE = /(?:^|[;&|\r\n(]\s*)@*(?:[^\s;|&()]*[\\/])?cmd(?:\.exe)?\b/i;
+
 function matchQuotedHeredocDelim(str, i) {
   if (str[i - 1] === "<" || str[i] !== "<" || str[i + 1] !== "<" || str[i + 2] === "<") {
     return null;
@@ -460,12 +462,15 @@ function matchQuotedHeredocDelim(str, i) {
   while (j < str.length && (str[j] === " " || str[j] === "\t")) j++;
   const start = j;
   let delim = "";
+  let quoted = false;
   while (j < str.length && !/[\s;&|<>()]/.test(str[j])) {
     if (str[j] === "'") {
+      quoted = true;
       j++;
       while (j < str.length && str[j] !== "'") delim += str[j++];
       if (j < str.length) j++;
     } else if (str[j] === '"') {
+      quoted = true;
       j++;
       while (j < str.length && str[j] !== '"') {
         if (str[j] === "\\" && j + 1 < str.length && /["\\$`]/.test(str[j + 1])) {
@@ -482,6 +487,7 @@ function matchQuotedHeredocDelim(str, i) {
       str[j + 1] !== "\n" &&
       str[j + 1] !== "\r"
     ) {
+      quoted = true;
       delim += str[j + 1];
       j += 2;
     } else {
@@ -533,7 +539,7 @@ function matchQuotedHeredocDelim(str, i) {
   ) {
     return null;
   }
-  return { endIdx: j, delim, stripTabs };
+  return { endIdx: j, delim, stripTabs, quoted };
 }
 
 function findHeredocBodyEnd(str, bodyStartIdx, delim, stripTabs) {
@@ -552,8 +558,8 @@ function findHeredocBodyEnd(str, bodyStartIdx, delim, stripTabs) {
   return str.length;
 }
 
-function stripLineContinuations(str) {
-  if (!str || typeof str !== "string" || (!str.includes("\\") && !str.includes("#"))) return str;
+function stripLineContinuations(str, { allowHashComments = true } = {}) {
+  if (!str || typeof str !== "string" || !str.includes("\\")) return str;
   let out = "";
   let inSingle = false;
   let inDouble = false;
@@ -582,11 +588,13 @@ function stripLineContinuations(str) {
       continue;
     }
     if (
+      allowHashComments &&
       !inSingle &&
       !inDouble &&
       !inBacktick &&
       ch === "#" &&
-      (out.length === 0 || /(?<!\\)[\s;&|()]$/.test(out))
+      (out.length === 0 || /(?<!\\)[\s;&|()]$/.test(out)) &&
+      !CMD_EXE_PREFIX_RE.test(out)
     ) {
       while (i + 1 < str.length && str[i + 1] !== "\n") {
         i++;
@@ -633,16 +641,21 @@ function stripLineContinuations(str) {
   return out;
 }
 
-function matchesAndroidOrAtcText(rawStr, inheritedVars = {}, toolRegex = FAST_PATH_REGEX) {
+function matchesAndroidOrAtcText(
+  rawStr,
+  inheritedVars = {},
+  toolRegex = FAST_PATH_REGEX,
+  { allowHashComments = true } = {},
+) {
   if (!rawStr || typeof rawStr !== "string") return false;
-  const str = stripLineContinuations(rawStr);
+  const str = stripLineContinuations(rawStr, { allowHashComments });
   if (toolRegex.test(str)) return true;
   const subCols = [];
   const subBase =
     str.includes("$") || str.includes("`") ? extractCommandSubstitutions(str, subCols) : str;
   const subExpanded =
     subCols.length > 0
-      ? `${subBase} ${subCols.map((s) => stripLineContinuations(s)).join(" ")}`
+      ? `${subBase} ${subCols.map((s) => stripLineContinuations(s, { allowHashComments })).join(" ")}`
       : subBase;
   const ansiDecoded = subExpanded.replace(/\$'((?:\\.|[^'])*)'/g, (_m, inner) =>
     decodeShellEscapes(inner),
@@ -769,7 +782,7 @@ function isExtglobOpen(str, i, curStage = "") {
   return false;
 }
 
-function splitOutsideQuotes(str, sepType) {
+function splitOutsideQuotes(str, sepType, { allowHashComments = true } = {}) {
   const parts = [];
   let cur = "";
   let inSingle = false;
@@ -785,13 +798,15 @@ function splitOutsideQuotes(str, sepType) {
       continue;
     }
     if (
+      allowHashComments &&
       !inSingle &&
       !inDouble &&
       !inBacktick &&
       arithDepth === 0 &&
       subParenDepth === 0 &&
       ch === "#" &&
-      (cur.length === 0 || /(?<!\\)[\s;&|()]$/.test(cur))
+      (cur.length === 0 || /(?<!\\)[\s;&|()]$/.test(cur)) &&
+      !CMD_EXE_PREFIX_RE.test(cur)
     ) {
       while (i + 1 < str.length && str[i + 1] !== "\n") {
         i++;
@@ -935,23 +950,42 @@ function extractCommandSubstitutions(str, innerSubstitutions) {
   let out = "";
   let inSingle = false;
   let inDouble = false;
+  let pendingHeredoc = null;
+  let inUnquotedHeredocUntil = -1;
 
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
+    const inUnquotedHeredoc = i < inUnquotedHeredocUntil;
     if (ch === "\\" && !inSingle && i + 1 < str.length) {
       out += ch + str[i + 1];
       i++;
       continue;
     }
-    if (ch === "'" && !inDouble) {
+    if (!inUnquotedHeredoc && ch === "'" && !inDouble) {
       inSingle = !inSingle;
       out += ch;
       continue;
     }
-    if (ch === '"' && !inSingle) {
+    if (!inUnquotedHeredoc && ch === '"' && !inSingle) {
       inDouble = !inDouble;
       out += ch;
       continue;
+    }
+    if (!inUnquotedHeredoc && !inSingle && !inDouble) {
+      if (ch === "<") {
+        const hd = matchQuotedHeredocDelim(str, i);
+        if (hd && !hd.quoted) {
+          pendingHeredoc = hd;
+        }
+      } else if (ch === "\n" && pendingHeredoc) {
+        inUnquotedHeredocUntil = findHeredocBodyEnd(
+          str,
+          i + 1,
+          pendingHeredoc.delim,
+          pendingHeredoc.stripTabs,
+        );
+        pendingHeredoc = null;
+      }
     }
     if (
       !inSingle &&
@@ -1024,7 +1058,7 @@ function extractCommandSubstitutions(str, innerSubstitutions) {
   return out;
 }
 
-export function splitShellSegments(command) {
+export function splitShellSegments(command, { allowHashComments = true } = {}) {
   if (!command || typeof command !== "string") return [];
   const innerSubstitutions = [];
   const inlineExpanded = extractCommandSubstitutions(command, innerSubstitutions);
@@ -1032,14 +1066,14 @@ export function splitShellSegments(command) {
     innerSubstitutions.length > 0
       ? `${inlineExpanded}\n; ${innerSubstitutions.join(" ; ")}`
       : inlineExpanded;
-  const clauses = splitOutsideQuotes(normalized, "clause");
+  const clauses = splitOutsideQuotes(normalized, "clause", { allowHashComments });
   const segments = [];
   for (const clause of clauses) {
-    const stages = splitOutsideQuotes(clause, "pipe");
+    const stages = splitOutsideQuotes(clause, "pipe", { allowHashComments });
     const upstreamArgs = [];
     for (let i = 0; i < stages.length; i++) {
       const stage = stages[i];
-      const parsedStage = parseSegment(stage);
+      const parsedStage = parseSegment(stage, {}, { allowHashComments });
       if (i > 0 && upstreamArgs.length > 0) {
         if (SHELL_WRAPPERS.has(parsedStage.baseCmd)) {
           segments.push(`${stage} ${upstreamArgs.map((a) => JSON.stringify(a)).join(" ")}`);
@@ -1052,7 +1086,12 @@ export function splitShellSegments(command) {
         segments.push(stage);
       }
       for (const arg of parsedStage.args) {
-        if (!/^-[A-Za-z0-9]+$/.test(arg) || matchesAndroidOrAtcText(arg, parsedStage.envVars)) {
+        if (
+          !/^-[A-Za-z0-9]+$/.test(arg) ||
+          matchesAndroidOrAtcText(arg, parsedStage.envVars, FAST_PATH_REGEX, {
+            allowHashComments,
+          })
+        ) {
           upstreamArgs.push(arg);
         }
       }
@@ -1061,15 +1100,18 @@ export function splitShellSegments(command) {
   return segments;
 }
 
-export function tokenizeSegment(segment, { preserveLiteralDollar = false } = {}) {
+export function tokenizeSegment(
+  segment,
+  { preserveLiteralDollar = false, allowHashComments = true } = {},
+) {
   const tokens = [];
-  const str = stripLineContinuations(String(segment || ""));
+  const str = stripLineContinuations(String(segment || ""), { allowHashComments });
   const isWinPathLike = (s) => /^(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
   let i = 0;
   while (i < str.length) {
     while (i < str.length && /\s/.test(str[i])) i++;
     if (i >= str.length) break;
-    if (str[i] === "#") {
+    if (allowHashComments && str[i] === "#" && !CMD_EXE_PREFIX_RE.test(str.slice(0, i))) {
       while (i < str.length && str[i] !== "\n") i++;
       continue;
     }
@@ -1424,7 +1466,7 @@ export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_su
   return out.replace(/\uE000/g, "$");
 }
 
-export function parseSegment(segment, inheritedVars = {}) {
+export function parseSegment(segment, inheritedVars = {}, { allowHashComments = true } = {}) {
   const rawStripped = String(segment || "")
     .trimStart()
     .replace(LEADING_CONTROL_PREFIX_RE, "");
@@ -1435,7 +1477,10 @@ export function parseSegment(segment, inheritedVars = {}) {
     rawStripped.includes("`")
       ? extractCommandSubstitutions(rawStripped, [])
       : rawStripped;
-  const tokens = tokenizeSegment(strippedSegment, { preserveLiteralDollar: true });
+  const tokens = tokenizeSegment(strippedSegment, {
+    preserveLiteralDollar: true,
+    allowHashComments,
+  });
   let baseVars = { ...inheritedVars };
   const envVars = {};
   let stripsAndroidSerial = Boolean(inheritedVars.__atc_stripped_android_serial);
@@ -1934,8 +1979,13 @@ export function extractTargetSerial(parsed) {
   return null;
 }
 
-export function classifySegment(segment, inheritedVars = {}, depth = 0) {
-  const parsed = parseSegment(segment, inheritedVars);
+export function classifySegment(
+  segment,
+  inheritedVars = {},
+  depth = 0,
+  { allowHashComments = true } = {},
+) {
+  const parsed = parseSegment(segment, inheritedVars, { allowHashComments });
   if (depth > 8) {
     return {
       kind: "device_action",
@@ -2489,6 +2539,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
   // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`, `eval adb shell ...`)
   if (SHELL_WRAPPERS.has(baseCmd)) {
+    const innerAllowHash = allowHashComments && baseCmd !== "cmd";
     const cShells = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"]);
     const innerEntries = [];
     let handledCWrapper = false;
@@ -2536,10 +2587,19 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         innerEntries.push({ script: normalizedScript, vars: wrapperVars });
       }
     }
-    if (!handledCWrapper && matchesAndroidOrAtcText(effectiveSegment, parsed.envVars)) {
+    if (
+      !handledCWrapper &&
+      matchesAndroidOrAtcText(effectiveSegment, parsed.envVars, FAST_PATH_REGEX, {
+        allowHashComments: innerAllowHash,
+      })
+    ) {
       const nonFlagArgs = args.filter((a) => !a.startsWith("-") && a !== "<<<" && a !== "<<");
       for (const a of args) {
-        if (matchesAndroidOrAtcText(a, parsed.envVars)) {
+        if (
+          matchesAndroidOrAtcText(a, parsed.envVars, FAST_PATH_REGEX, {
+            allowHashComments: innerAllowHash,
+          })
+        ) {
           innerEntries.push({ script: a, vars: { ...parsed.envVars } });
         }
       }
@@ -2552,9 +2612,11 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       const rank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
       for (const { script: inner, vars: baseInnerVars } of innerEntries) {
         const innerVars = { ...baseInnerVars };
-        for (const subSeg of splitShellSegments(inner)) {
+        for (const subSeg of splitShellSegments(inner, { allowHashComments: innerAllowHash })) {
           if (subSeg.trim() === effectiveSegment.trim()) continue;
-          const subClass = classifySegment(subSeg, innerVars, depth + 1);
+          const subClass = classifySegment(subSeg, innerVars, depth + 1, {
+            allowHashComments: innerAllowHash,
+          });
           Object.assign(innerVars, subClass.parsed?.envVars || {});
           if (subClass.parsed?.stripsAndroidSerial) {
             delete innerVars.ANDROID_SERIAL;
@@ -2609,7 +2671,9 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
   if (
     (!PASSIVE_NON_EXEC_COMMANDS.has(baseCmd) || isExecutablePassive) &&
-    matchesAndroidOrAtcText(effectiveSegment, parsed.envVars, STANDALONE_TOOL_REGEX)
+    matchesAndroidOrAtcText(effectiveSegment, parsed.envVars, STANDALONE_TOOL_REGEX, {
+      allowHashComments,
+    })
   ) {
     const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
     const searchArgs = args.slice(startSearchIdx);
@@ -2621,6 +2685,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       let sawNodeTest = false;
       let sawNodeCheck = false;
       let hasEvalFlag = false;
+      let hasPreloadFlag = Boolean(parsed.envVars?.NODE_OPTIONS);
       const nodePositional = [];
       for (let i = 0; i < searchArgs.length; i++) {
         const tok = searchArgs[i];
@@ -2659,14 +2724,27 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
           continue;
         }
         if (
-          (tok === "-r" ||
-            tok === "--require" ||
-            tok === "--import" ||
-            tok === "--loader" ||
-            tok === "--experimental-loader") &&
-          i + 1 < searchArgs.length
+          tok === "-r" ||
+          tok === "--require" ||
+          tok === "--import" ||
+          tok === "--loader" ||
+          tok === "--experimental-loader"
         ) {
-          i += 1;
+          hasPreloadFlag = true;
+          if (i + 1 < searchArgs.length) {
+            nodeOptValueIndices.add(i + 1);
+            i += 1;
+          }
+          continue;
+        }
+        if (
+          (tok.startsWith("-r") && tok.length > 2) ||
+          tok.startsWith("--require=") ||
+          tok.startsWith("--import=") ||
+          tok.startsWith("--loader=") ||
+          tok.startsWith("--experimental-loader=")
+        ) {
+          hasPreloadFlag = true;
           continue;
         }
         if (tok.startsWith("-")) continue;
@@ -2678,6 +2756,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       }
       if (
         !hasEvalFlag &&
+        !hasPreloadFlag &&
         (sawNodeCheck ||
           (sawNodeTest &&
             nodePositional.length > 0 &&
@@ -2736,7 +2815,12 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       }
     }
     const candidateSourceArgs =
-      sedOrAwkScripts !== null ? sedOrAwkScripts : args.slice(startSearchIdx);
+      sedOrAwkScripts !== null
+        ? sedOrAwkScripts
+        : [
+            ...args.slice(startSearchIdx),
+            ...(isNodeCmd && parsed.envVars?.NODE_OPTIONS ? [parsed.envVars.NODE_OPTIONS] : []),
+          ];
     const embeddedCandidates = extractEmbeddedCommands(candidateSourceArgs);
     if (embeddedCandidates.length > 0) {
       const embeddedSerials = new Set();
@@ -2987,6 +3071,7 @@ function splitTrailingControlClosers(cmdBody) {
 }
 
 function rewriteStageCommandSubstitutions(stageText, rewriteOpts) {
+  const { ignoreSingleQuotes = false, ...childRewriteOpts } = rewriteOpts || {};
   let rewrittenStage = "";
   let maskedStage = "";
   let changed = false;
@@ -3001,13 +3086,13 @@ function rewriteStageCommandSubstitutions(stageText, rewriteOpts) {
       i++;
       continue;
     }
-    if (ch === "'" && !inDouble) {
+    if (!ignoreSingleQuotes && ch === "'" && !inDouble) {
       inSingle = !inSingle;
       rewrittenStage += ch;
       maskedStage += ch;
       continue;
     }
-    if (ch === '"' && !inSingle) {
+    if (!ignoreSingleQuotes && ch === '"' && !inSingle) {
       inDouble = !inDouble;
       rewrittenStage += ch;
       maskedStage += ch;
@@ -3041,7 +3126,7 @@ function rewriteStageCommandSubstitutions(stageText, rewriteOpts) {
       }
       if (depth === 0) {
         const inner = stageText.slice(i + 2, j - 1);
-        const rewrittenInner = rewriteCompoundCommand(inner, rewriteOpts);
+        const rewrittenInner = rewriteCompoundCommand(inner, childRewriteOpts);
         if (rewrittenInner !== inner) {
           changed = true;
           rewrittenStage += `${ch}(${rewrittenInner})`;
@@ -3066,7 +3151,7 @@ function rewriteStageCommandSubstitutions(stageText, rewriteOpts) {
       }
       if (j < stageText.length && stageText[j] === "`") {
         const inner = stageText.slice(i + 1, j);
-        const rewrittenInner = rewriteCompoundCommand(inner, rewriteOpts);
+        const rewrittenInner = rewriteCompoundCommand(inner, childRewriteOpts);
         if (rewrittenInner !== inner) {
           changed = true;
           rewrittenStage += `\`${rewrittenInner}\``;
@@ -4354,10 +4439,15 @@ function rewriteCompoundCommand(
   let arithDepth = 0;
   let pendingHeredoc = null;
   let inQuotedHeredocUntil = -1;
+  let inHeredocQuoted = false;
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     if (i < inQuotedHeredocUntil) {
-      tokens.push({ type: "sep", text: command.slice(i, inQuotedHeredocUntil) });
+      tokens.push({
+        type: "heredoc_body",
+        text: command.slice(i, inQuotedHeredocUntil),
+        quoted: inHeredocQuoted,
+      });
       i = inQuotedHeredocUntil - 1;
       continue;
     }
@@ -4368,7 +4458,8 @@ function rewriteCompoundCommand(
       subParenDepth === 0 &&
       arithDepth === 0 &&
       ch === "#" &&
-      (cur.length === 0 || /(?<!\\)[\s;&|()]$/.test(cur))
+      (cur.length === 0 || /(?<!\\)[\s;&|()]$/.test(cur)) &&
+      !CMD_EXE_PREFIX_RE.test(cur)
     ) {
       while (i + 1 < command.length && command[i + 1] !== "\n") {
         cur += command[i++];
@@ -4476,6 +4567,7 @@ function rewriteCompoundCommand(
             pendingHeredoc.delim,
             pendingHeredoc.stripTabs,
           );
+          inHeredocQuoted = Boolean(pendingHeredoc.quoted);
           pendingHeredoc = null;
         }
         tokens.push({ type: "stage", text: cur });
@@ -4587,6 +4679,17 @@ function rewriteCompoundCommand(
   let loopDepth = Number.isInteger(inheritedLoopDepth) && inheritedLoopDepth > 0 ? inheritedLoopDepth : 0;
   return tokens
     .map((tok) => {
+      if (tok.type === "heredoc_body") {
+        if (tok.quoted) {
+          return tok.text;
+        }
+        return rewriteStageCommandSubstitutions(tok.text, {
+          ...rewriteOpts,
+          inheritedShellVars: shellVars,
+          inheritedLoopDepth: loopDepth,
+          ignoreSingleQuotes: true,
+        }).rewrittenStage;
+      }
       if (tok.type !== "stage") {
         const sepTrimmed = tok.text.trim();
         if (sepTrimmed === "|" || sepTrimmed === "|&") {
