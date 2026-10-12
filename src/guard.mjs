@@ -3,19 +3,20 @@ import path from "node:path";
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
 const TOOL_NAMES_RE_SRC =
   "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
-const TOOL_EXEC_EXT_RE_SRC =
-  "(?:exe|bat|cmd|com|ps1|psm1|vbs|wsf|sh|bash|zsh|dash|ksh|fish|csh|tcsh|mjs|cjs|js|ts|mts|cts|py|pyw|pl|pm|rb|php|phar|lua|tcl|awk|sed|jar|run|bin|out|appimage)";
+const NON_EXEC_EXT_RE_SRC =
+  "(?:json|jsonl|md|markdown|txt|log|ya?ml|toml|ini|cfg|conf|properties|xml|html?|css|scss|less|csv|tsv|sql|lock|map|bak|orig|rej|png|jpe?g|gif|svg|webp|ico|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|wasm|o|a|so|dylib|dll|pdb|class|dex|apk|aab|ipa)";
+const TOOL_EXEC_EXT_RE_SRC = `(?!${NON_EXEC_EXT_RE_SRC}\\b)[A-Za-z0-9_]+`;
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
 const ATC_WIN_SESSION_RE = new RegExp(
-  `\\b(atc(?:\\.${TOOL_EXEC_EXT_RE_SRC})?["']?)(\\s+[A-Za-z0-9_-]+)`,
+  `(?<![A-Za-z0-9_.-])(atc(?:\\.${TOOL_EXEC_EXT_RE_SRC})?["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|$)`,
   "i",
 );
 // Stricter than FAST_PATH_REGEX: the tool name must be a standalone token or executable basename
-// (`adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `bin/atc.mjs`, `scripts/adb.py`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`),
-// not a directory segment or fragment of a longer word/identifier (`my-android-app/`, `atc.test.mjs`,
-// `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
+// (`adb`, `@adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `bin/atc.mjs`, `scripts/adb.py`, `scripts/adb.command`,
+// `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a directory segment or fragment of a longer
+// word/identifier (`my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
 const STANDALONE_TOOL_REGEX = new RegExp(
-  `(?:(?<![A-Za-z0-9_.@-])${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_]))?(?![A-Za-z0-9_.@/\\\\-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
+  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_]))?(?![A-Za-z0-9_.@/\\\\-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
   "i",
 );
 const TRANSPARENT_WRAPPERS = new Set([
@@ -201,7 +202,8 @@ function decodeShellEscapes(str) {
 
 function extractExecutableBase(tok) {
   if (!tok || typeof tok !== "string") return "";
-  const file = tok.split(/[\\/]/).pop() || "";
+  const cleaned = tok.replace(/^@+/, "");
+  const file = cleaned.split(/[\\/]/).pop() || "";
   if (!file || /[\s"'`();|&[\]{},<>]/.test(file)) return "";
   return file.replace(TOOL_EXEC_EXT_STRIP_RE, "").toLowerCase();
 }
@@ -4620,7 +4622,7 @@ function rewriteCompoundCommand(
           );
         if (!hasSession) {
           finishLoopDepth();
-          return trimmed.replace(ATC_WIN_SESSION_RE, `$1$2 ${sessionFlags}`);
+          return trimmed.replace(ATC_WIN_SESSION_RE, `$1 ${sessionFlags}`);
         }
       }
       finishLoopDepth();

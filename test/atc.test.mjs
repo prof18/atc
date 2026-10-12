@@ -732,6 +732,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "python3 scripts/adb.py shell pm clear com.x",
     "perl scripts/adb.pl shell pm clear com.x",
     "ruby scripts/adb.rb shell pm clear com.x",
+    "bash scripts/adb.command shell pm clear com.x",
+    "@adb shell pm clear com.x",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
@@ -744,6 +746,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     `xargs "/opt/Android SDK/platform-tools/adb" kill-server </dev/null`,
     "perl -e 'qx!adb kill-server!'",
     "python3 scripts/adb.py kill-server",
+    "@adb kill-server",
+    'cmd.exe /c "@adb kill-server"',
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
   }
@@ -753,6 +757,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
   assert.equal(atcWinRes.allowed, true);
   assert.match(atcWinRes.rewrittenCommand || "", /--session sess-unleased/);
+  const atcWinOptRes = evaluateCommandGuard("node bin/atc.mjs --anchor-pid 42 free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcWinOptRes.allowed, true);
+  assert.equal(
+    atcWinOptRes.rewrittenCommand,
+    "node bin/atc.mjs --session sess-unleased --anchor-pid 42 free",
+  );
 });
 
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
