@@ -87,6 +87,11 @@ const WRAPPER_VALUE_FLAGS = new Set([
   "--package",
   "-w",
   "--workspace",
+  "--dir",
+  "--cwd",
+  "-F",
+  "--filter",
+  "--loglevel",
   "--prefix",
   "--shell",
   "--userconfig",
@@ -302,8 +307,6 @@ function extractExecutableBase(tok, { allowPackageSpec = false } = {}) {
   if (!file || /[\s"'`();|&[\]{},<>]/.test(file)) return "";
   if (allowPackageSpec || isScopedPkg) {
     file = file.replace(/@[A-Za-z0-9._~^>=<+-]+$/, "");
-  } else {
-    file = file.replace(NPM_VERSION_TAG_STRIP_RE, "");
   }
   return file.replace(TOOL_EXEC_EXT_STRIP_RE, "").toLowerCase();
 }
@@ -407,19 +410,109 @@ function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") 
   return "__atc_cmd_sub__";
 }
 
+function matchQuotedHeredocDelim(str, i) {
+  if (str[i] !== "<" || str[i + 1] !== "<" || str[i + 2] === "<") return null;
+  let j = i + 2;
+  let stripTabs = false;
+  if (str[j] === "-") {
+    stripTabs = true;
+    j++;
+  }
+  while (j < str.length && (str[j] === " " || str[j] === "\t")) j++;
+  const start = j;
+  let delim = "";
+  let quoted = false;
+  while (j < str.length && !/[\s;&|<>()]/.test(str[j])) {
+    if (str[j] === "'") {
+      quoted = true;
+      j++;
+      while (j < str.length && str[j] !== "'") delim += str[j++];
+      if (j < str.length) j++;
+    } else if (str[j] === '"') {
+      quoted = true;
+      j++;
+      while (j < str.length && str[j] !== '"') {
+        if (str[j] === "\\" && j + 1 < str.length && /["\\$`]/.test(str[j + 1])) {
+          delim += str[j + 1];
+          j += 2;
+        } else {
+          delim += str[j++];
+        }
+      }
+      if (j < str.length) j++;
+    } else if (
+      str[j] === "\\" &&
+      j + 1 < str.length &&
+      str[j + 1] !== "\n" &&
+      str[j + 1] !== "\r"
+    ) {
+      quoted = true;
+      delim += str[j + 1];
+      j += 2;
+    } else {
+      delim += str[j++];
+    }
+  }
+  if (!quoted || !delim || j === start) return null;
+  return { endIdx: j, delim, stripTabs };
+}
+
+function findHeredocBodyEnd(str, bodyStartIdx, delim, stripTabs) {
+  let lineStart = bodyStartIdx;
+  while (lineStart < str.length) {
+    let lineEnd = str.indexOf("\n", lineStart);
+    if (lineEnd === -1) lineEnd = str.length;
+    let line = str.slice(lineStart, lineEnd);
+    if (line.endsWith("\r")) line = line.slice(0, -1);
+    const checkLine = stripTabs ? line.replace(/^\t+/, "") : line;
+    if (checkLine === delim) {
+      return lineEnd;
+    }
+    lineStart = lineEnd + 1;
+  }
+  return str.length;
+}
+
 function stripLineContinuations(str) {
   if (!str || typeof str !== "string" || !str.includes("\\")) return str;
   let out = "";
   let inSingle = false;
+  let inDouble = false;
+  let pendingHeredoc = null;
+  let inQuotedHeredocUntil = -1;
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
-    if (ch === "'" && !inSingle) {
-      inSingle = true;
+    if (i < inQuotedHeredocUntil) {
       out += ch;
       continue;
     }
-    if (ch === "'" && inSingle) {
-      inSingle = false;
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      out += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      out += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble && ch === "<") {
+      const hd = matchQuotedHeredocDelim(str, i);
+      if (hd) {
+        pendingHeredoc = hd;
+        out += str.slice(i, hd.endIdx);
+        i = hd.endIdx - 1;
+        continue;
+      }
+    }
+    if (!inSingle && !inDouble && ch === "\n" && pendingHeredoc) {
+      inQuotedHeredocUntil = findHeredocBodyEnd(
+        str,
+        i + 1,
+        pendingHeredoc.delim,
+        pendingHeredoc.stripTabs,
+      );
+      pendingHeredoc = null;
       out += ch;
       continue;
     }
@@ -581,8 +674,19 @@ function splitOutsideQuotes(str, sepType) {
   let inDouble = false;
   let arithDepth = 0;
   let subParenDepth = 0;
+  let pendingHeredoc = null;
+  let inQuotedHeredocUntil = -1;
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
+    if (i < inQuotedHeredocUntil) {
+      if (sepType === "clause" && ch === "\n") {
+        if (cur.trim()) parts.push(cur.trim());
+        cur = "";
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
     if (ch === "\\" && !inSingle && i + 1 < str.length) {
       if (str[i + 1] === "\n") {
         i++;
@@ -607,6 +711,12 @@ function splitOutsideQuotes(str, sepType) {
       continue;
     }
     if (!inSingle && !inDouble) {
+      if (ch === "<") {
+        const hd = matchQuotedHeredocDelim(str, i);
+        if (hd) {
+          pendingHeredoc = hd;
+        }
+      }
       if (arithDepth === 0 && ch === "$" && str[i + 1] === "(" && str[i + 2] === "(") {
         arithDepth = 2;
         cur += "$((";
@@ -671,6 +781,15 @@ function splitOutsideQuotes(str, sepType) {
             str[i - 1] !== "<" &&
             str[i - 1] !== "|")
         ) {
+          if (ch === "\n" && pendingHeredoc) {
+            inQuotedHeredocUntil = findHeredocBodyEnd(
+              str,
+              i + 1,
+              pendingHeredoc.delim,
+              pendingHeredoc.stripTabs,
+            );
+            pendingHeredoc = null;
+          }
           if (cur.trim()) parts.push(cur.trim());
           cur = "";
           continue;
@@ -1438,54 +1557,83 @@ export function parseSegment(segment, inheritedVars = {}) {
       }
       continue;
     }
-    if (
-      (base === "npm" && (tokens[idx + 1] === "exec" || tokens[idx + 1] === "x")) ||
-      ((base === "pnpm" || base === "yarn") &&
-        (tokens[idx + 1] === "dlx" || tokens[idx + 1] === "exec"))
-    ) {
-      idx += 2;
-      isPackageExec = true;
-      while (idx < tokens.length && tokens[idx].startsWith("-")) {
-        const flag = tokens[idx++];
-        if (flag === "--") break;
-        if (base === "npm" && (flag === "-c" || flag === "--call")) {
-          const callStr = tokens[idx] || "";
-          if (idx < tokens.length) {
-            tokens.splice(idx, 1, "sh", "-c", callStr);
-          }
-          break;
-        }
+    if (base === "npm" || base === "pnpm" || base === "yarn") {
+      let scanIdx = idx + 1;
+      while (scanIdx < tokens.length && tokens[scanIdx].startsWith("-")) {
+        const gFlag = tokens[scanIdx++];
+        if (gFlag === "--") break;
         if (
-          base === "npm" &&
-          (flag.startsWith("--call=") || (flag.startsWith("-c=") && flag.length > 3))
+          (gFlag === "-C" ||
+            gFlag === "--dir" ||
+            gFlag === "--prefix" ||
+            gFlag === "-w" ||
+            gFlag === "--workspace" ||
+            gFlag === "-F" ||
+            gFlag === "--filter" ||
+            gFlag === "--cwd" ||
+            gFlag === "--userconfig" ||
+            gFlag === "--cache" ||
+            gFlag === "--registry" ||
+            gFlag === "--loglevel") &&
+          scanIdx < tokens.length
         ) {
-          const callStr = flag.slice(flag.indexOf("=") + 1);
-          tokens.splice(idx, 0, "sh", "-c", callStr);
-          break;
-        }
-        if (
-          (flag === "-w" ||
-            flag === "--workspace" ||
-            flag === "--prefix" ||
-            flag === "--shell") &&
-          idx < tokens.length
-        ) {
-          idx++;
-        } else if (
-          (flag === "-p" || flag === "--package") &&
-          idx < tokens.length &&
-          tokens.slice(idx + 1).some((t) => t !== "--")
-        ) {
-          idx++;
-        } else if (
-          (flag.startsWith("--package=") || (flag.startsWith("-p=") && flag.length > 3)) &&
-          !tokens.slice(idx).some((t) => t !== "--")
-        ) {
-          tokens.splice(idx, 0, flag.slice(flag.indexOf("=") + 1));
-          break;
+          scanIdx++;
         }
       }
-      continue;
+      const subTok = tokens[scanIdx] || "";
+      const isPkgSub =
+        (base === "npm" && (subTok === "exec" || subTok === "x")) ||
+        ((base === "pnpm" || base === "yarn") && (subTok === "dlx" || subTok === "exec"));
+      if (isPkgSub) {
+        idx = scanIdx + 1;
+        isPackageExec = true;
+        while (idx < tokens.length && tokens[idx].startsWith("-")) {
+          const flag = tokens[idx++];
+          if (flag === "--") break;
+          if (base === "npm" && (flag === "-c" || flag === "--call")) {
+            const callStr = tokens[idx] || "";
+            if (idx < tokens.length) {
+              tokens.splice(idx, 1, "sh", "-c", callStr);
+            }
+            break;
+          }
+          if (
+            base === "npm" &&
+            (flag.startsWith("--call=") || (flag.startsWith("-c=") && flag.length > 3))
+          ) {
+            const callStr = flag.slice(flag.indexOf("=") + 1);
+            tokens.splice(idx, 0, "sh", "-c", callStr);
+            break;
+          }
+          if (
+            (flag === "-C" ||
+              flag === "--dir" ||
+              flag === "--cwd" ||
+              flag === "-F" ||
+              flag === "--filter" ||
+              flag === "-w" ||
+              flag === "--workspace" ||
+              flag === "--prefix" ||
+              flag === "--shell") &&
+            idx < tokens.length
+          ) {
+            idx++;
+          } else if (
+            (flag === "-p" || flag === "--package") &&
+            idx < tokens.length &&
+            tokens.slice(idx + 1).some((t) => t !== "--")
+          ) {
+            idx++;
+          } else if (
+            (flag.startsWith("--package=") || (flag.startsWith("-p=") && flag.length > 3)) &&
+            !tokens.slice(idx).some((t) => t !== "--")
+          ) {
+            tokens.splice(idx, 0, flag.slice(flag.indexOf("=") + 1));
+            break;
+          }
+        }
+        continue;
+      }
     }
     break;
   }
@@ -3929,8 +4077,20 @@ function rewriteCompoundCommand(
   let inBacktick = false;
   let subParenDepth = 0;
   let arithDepth = 0;
+  let pendingHeredoc = null;
+  let inQuotedHeredocUntil = -1;
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
+    if (i < inQuotedHeredocUntil) {
+      if (ch === "\n") {
+        tokens.push({ type: "stage", text: cur });
+        tokens.push({ type: "sep", text: "\n" });
+        cur = "";
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
     if (ch === "\\" && !inSingle && i + 1 < command.length) {
       cur += ch + command[i + 1];
       i++;
@@ -3953,6 +4113,12 @@ function rewriteCompoundCommand(
         continue;
       }
       if (!inBacktick) {
+        if (!inDouble && ch === "<") {
+          const hd = matchQuotedHeredocDelim(command, i);
+          if (hd) {
+            pendingHeredoc = hd;
+          }
+        }
         if (!inDouble && arithDepth === 0 && ch === "$" && command[i + 1] === "(" && command[i + 2] === "(") {
           arithDepth = 2;
           cur += "$((";
@@ -4018,6 +4184,15 @@ function rewriteCompoundCommand(
         continue;
       }
       if (ch === "\n") {
+        if (pendingHeredoc) {
+          inQuotedHeredocUntil = findHeredocBodyEnd(
+            command,
+            i + 1,
+            pendingHeredoc.delim,
+            pendingHeredoc.stripTabs,
+          );
+          pendingHeredoc = null;
+        }
         tokens.push({ type: "stage", text: cur });
         tokens.push({ type: "sep", text: "\n" });
         cur = "";
@@ -4909,14 +5084,12 @@ function rewriteCompoundCommand(
             `((?:^|[\\s=])["']?${escapedCmd}["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|["']|$)`,
             "gi",
           );
-          const preBoundaryRe = new RegExp(`^\\s+--\\s+.*\\b${escapedCmd}\\b`, "i");
           let match;
           let chosenMatch = null;
           while ((match = cmdRe.exec(trimmed)) !== null) {
             const before = trimmed.slice(0, match.index).trimEnd();
             const prevTok = before.split(/\s+/).pop() || "";
-            const after = trimmed.slice(match.index + match[0].length);
-            if (WRAPPER_VALUE_FLAGS.has(prevTok) || preBoundaryRe.test(after)) {
+            if (WRAPPER_VALUE_FLAGS.has(prevTok)) {
               cmdRe.lastIndex = match.index + 1;
               continue;
             }

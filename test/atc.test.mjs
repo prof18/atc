@@ -704,6 +704,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "bin/search --scope project:my-android-app notes",
     "node scripts/build.mjs --out dist/gradle-report.html",
     "node script.mjs 'a\\\ndb shell'",
+    "cat <<'EOF'\na\\\ndb shell\nEOF",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, true, cmd);
   }
@@ -744,6 +745,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "npx --call='adb shell getprop'",
     "npm exec --package adb@2 -- adb shell getprop",
     "pnpm dlx -c adb kill-server",
+    "pnpm -C adb@2 exec adb kill-server",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
@@ -767,6 +769,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "npm exec --package adb@2 -- adb kill-server",
     "npx -p adb@2 -- adb kill-server",
     "pnpm dlx -c adb kill-server",
+    "pnpm -C adb@2 exec adb kill-server",
     `node -e 'require("child_process").spawnSync(process.argv[2],process.argv.slice(3))' -- --title adb kill-server`,
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
@@ -774,6 +777,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   for (const cmd of [
     "perl -e 'print q!adb kill-server!'",
     "ruby -e 'puts %q!adb kill-server!'",
+    "cat <<'EOF'\na\\\ndb shell\nEOF",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, true, cmd);
   }
@@ -818,6 +822,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   assert.equal(
     atcNpmWsWinRes.rewrittenCommand,
     "npm exec --workspace atc -- atc free --session sess-unleased",
+  );
+  const atcExecEchoWinRes = evaluateCommandGuard("atc exec -- echo atc", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcExecEchoWinRes.allowed, true);
+  assert.equal(
+    atcExecEchoWinRes.rewrittenCommand,
+    "atc exec --session sess-unleased -- echo atc",
   );
   const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
   assert.equal(atcWinRes.allowed, true);
