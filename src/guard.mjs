@@ -3,15 +3,15 @@ import path from "node:path";
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
 const TOOL_NAMES_RE_SRC =
   "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
-const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%-]+";
-const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
+const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%-]+(?:\\.[A-Za-z0-9_+~%-]+)*";
+const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`(?<=.)\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
 const NPM_VERSION_TAG_RE_SRC =
   "(?:[0-9~^v][A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*[0-9][A-Za-z0-9_.-]*|latest|next|beta|alpha|canary|rc|dev|nightly)";
 const NPM_VERSION_TAG_STRIP_RE = new RegExp(`@${NPM_VERSION_TAG_RE_SRC}$`, "i");
 // Stricter than FAST_PATH_REGEX: the tool name must be a standalone token or executable basename
 // (`adb`, `@adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `bin/atc.mjs`, `scripts/adb.py`, `scripts/adb.command`,
 // `npx @rock3r/atc@2`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a directory segment or fragment
-// of a longer word/identifier (`my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
+// of a longer word/identifier (`my-android-app/`, `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
 const STANDALONE_TOOL_REGEX = new RegExp(
   `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_+~%-])|@${NPM_VERSION_TAG_RE_SRC}(?![A-Za-z0-9_.-]))?(?![A-Za-z0-9_.@/\\\\~%-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
   "i",
@@ -181,6 +181,10 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "sed",
   "awk",
   "cat",
+  "tee",
+  "dd",
+  "patch",
+  "base64",
   "ls",
   "cd",
   "pwd",
@@ -188,6 +192,8 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "rm",
   "cp",
   "mv",
+  "ln",
+  "mktemp",
   "touch",
   "chmod",
   "chown",
@@ -199,6 +205,37 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "uniq",
   "tr",
   "cut",
+  "paste",
+  "join",
+  "comm",
+  "diff",
+  "cmp",
+  "column",
+  "fold",
+  "fmt",
+  "nl",
+  "rev",
+  "tac",
+  "od",
+  "xxd",
+  "hexdump",
+  "shasum",
+  "sha256sum",
+  "md5",
+  "md5sum",
+  "basename",
+  "dirname",
+  "realpath",
+  "readlink",
+  "stat",
+  "file",
+  "du",
+  "df",
+  "date",
+  "uname",
+  "whoami",
+  "id",
+  "hostname",
   "jq",
   "true",
   "false",
@@ -423,15 +460,12 @@ function matchQuotedHeredocDelim(str, i) {
   while (j < str.length && (str[j] === " " || str[j] === "\t")) j++;
   const start = j;
   let delim = "";
-  let quoted = false;
   while (j < str.length && !/[\s;&|<>()]/.test(str[j])) {
     if (str[j] === "'") {
-      quoted = true;
       j++;
       while (j < str.length && str[j] !== "'") delim += str[j++];
       if (j < str.length) j++;
     } else if (str[j] === '"') {
-      quoted = true;
       j++;
       while (j < str.length && str[j] !== '"') {
         if (str[j] === "\\" && j + 1 < str.length && /["\\$`]/.test(str[j + 1])) {
@@ -448,7 +482,6 @@ function matchQuotedHeredocDelim(str, i) {
       str[j + 1] !== "\n" &&
       str[j + 1] !== "\r"
     ) {
-      quoted = true;
       delim += str[j + 1];
       j += 2;
     } else {
@@ -456,51 +489,49 @@ function matchQuotedHeredocDelim(str, i) {
     }
   }
   if (!delim || j === start) return null;
-  if (!quoted) {
-    let lineStart = i;
-    while (
-      lineStart > 0 &&
-      str[lineStart - 1] !== "\n" &&
-      str[lineStart - 1] !== ";" &&
-      str[lineStart - 1] !== "&" &&
-      str[lineStart - 1] !== "|"
-    ) {
-      lineStart--;
-    }
-    let lineEnd = j;
-    while (lineEnd < str.length && str[lineEnd] !== "\n") {
-      lineEnd++;
-    }
-    const afterDelim = str.slice(j, lineEnd);
-    if (/(?:^|[^|])\|(?!\|)/.test(afterDelim)) {
-      return null;
-    }
-    const prefix = str
-      .slice(lineStart, i)
-      .trimStart()
-      .replace(LEADING_CONTROL_PREFIX_RE, "");
-    const prefixTokens = prefix
-      .trim()
-      .split(/\s+/)
-      .filter((t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
-    while (
-      prefixTokens.length > 0 &&
-      (TRANSPARENT_WRAPPERS.has(extractExecutableBase(prefixTokens[0])) ||
-        prefixTokens[0].startsWith("-"))
-    ) {
-      prefixTokens.shift();
-    }
-    const firstBase = prefixTokens[0] ? extractExecutableBase(prefixTokens[0]) : "";
-    if (
-      !firstBase ||
-      !PASSIVE_NON_EXEC_COMMANDS.has(firstBase) ||
-      firstBase === "sed" ||
-      firstBase === "awk" ||
-      firstBase === "find" ||
-      firstBase === "git"
-    ) {
-      return null;
-    }
+  let lineStart = i;
+  while (
+    lineStart > 0 &&
+    str[lineStart - 1] !== "\n" &&
+    str[lineStart - 1] !== ";" &&
+    str[lineStart - 1] !== "&" &&
+    str[lineStart - 1] !== "|"
+  ) {
+    lineStart--;
+  }
+  let lineEnd = j;
+  while (lineEnd < str.length && (str[lineEnd] !== "\n" || str[lineEnd - 1] === "\\")) {
+    lineEnd++;
+  }
+  const afterDelim = str.slice(j, lineEnd);
+  if (/(?:^|[^|])\|(?!\|)/.test(afterDelim)) {
+    return null;
+  }
+  const prefix = str
+    .slice(lineStart, i)
+    .trimStart()
+    .replace(LEADING_CONTROL_PREFIX_RE, "");
+  const prefixTokens = prefix
+    .trim()
+    .split(/\s+/)
+    .filter((t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+  while (
+    prefixTokens.length > 0 &&
+    (TRANSPARENT_WRAPPERS.has(extractExecutableBase(prefixTokens[0])) ||
+      prefixTokens[0].startsWith("-"))
+  ) {
+    prefixTokens.shift();
+  }
+  const firstBase = prefixTokens[0] ? extractExecutableBase(prefixTokens[0]) : "";
+  if (
+    !firstBase ||
+    !PASSIVE_NON_EXEC_COMMANDS.has(firstBase) ||
+    firstBase === "sed" ||
+    firstBase === "awk" ||
+    firstBase === "find" ||
+    firstBase === "git"
+  ) {
+    return null;
   }
   return { endIdx: j, delim, stripTabs };
 }
@@ -522,10 +553,11 @@ function findHeredocBodyEnd(str, bodyStartIdx, delim, stripTabs) {
 }
 
 function stripLineContinuations(str) {
-  if (!str || typeof str !== "string" || !str.includes("\\")) return str;
+  if (!str || typeof str !== "string" || (!str.includes("\\") && !str.includes("#"))) return str;
   let out = "";
   let inSingle = false;
   let inDouble = false;
+  let inBacktick = false;
   let pendingHeredoc = null;
   let inQuotedHeredocUntil = -1;
   for (let i = 0; i < str.length; i++) {
@@ -534,14 +566,31 @@ function stripLineContinuations(str) {
       out += ch;
       continue;
     }
-    if (ch === "'" && !inDouble) {
+    if (ch === "'" && !inDouble && !inBacktick) {
       inSingle = !inSingle;
       out += ch;
       continue;
     }
-    if (ch === '"' && !inSingle) {
+    if (ch === '"' && !inSingle && !inBacktick) {
       inDouble = !inDouble;
       out += ch;
+      continue;
+    }
+    if (ch === "`" && !inSingle) {
+      inBacktick = !inBacktick;
+      out += ch;
+      continue;
+    }
+    if (
+      !inSingle &&
+      !inDouble &&
+      !inBacktick &&
+      ch === "#" &&
+      (out.length === 0 || /(?<!\\)[\s;&|()]$/.test(out))
+    ) {
+      while (i + 1 < str.length && str[i + 1] !== "\n") {
+        i++;
+      }
       continue;
     }
     if (!inSingle && !inDouble && ch === "<") {
@@ -588,8 +637,13 @@ function matchesAndroidOrAtcText(rawStr, inheritedVars = {}, toolRegex = FAST_PA
   if (!rawStr || typeof rawStr !== "string") return false;
   const str = stripLineContinuations(rawStr);
   if (toolRegex.test(str)) return true;
+  const subCols = [];
+  const subBase =
+    str.includes("$") || str.includes("`") ? extractCommandSubstitutions(str, subCols) : str;
   const subExpanded =
-    str.includes("$") || str.includes("`") ? extractCommandSubstitutions(str, []) : str;
+    subCols.length > 0
+      ? `${subBase} ${subCols.map((s) => stripLineContinuations(s)).join(" ")}`
+      : subBase;
   const ansiDecoded = subExpanded.replace(/\$'((?:\\.|[^'])*)'/g, (_m, inner) =>
     decodeShellEscapes(inner),
   );
@@ -720,6 +774,7 @@ function splitOutsideQuotes(str, sepType) {
   let cur = "";
   let inSingle = false;
   let inDouble = false;
+  let inBacktick = false;
   let arithDepth = 0;
   let subParenDepth = 0;
   let pendingHeredoc = null;
@@ -727,11 +782,19 @@ function splitOutsideQuotes(str, sepType) {
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
     if (i < inQuotedHeredocUntil) {
-      if (sepType === "clause" && ch === "\n") {
-        if (cur.trim()) parts.push(cur.trim());
-        cur = "";
-      } else {
-        cur += ch;
+      continue;
+    }
+    if (
+      !inSingle &&
+      !inDouble &&
+      !inBacktick &&
+      arithDepth === 0 &&
+      subParenDepth === 0 &&
+      ch === "#" &&
+      (cur.length === 0 || /(?<!\\)[\s;&|()]$/.test(cur))
+    ) {
+      while (i + 1 < str.length && str[i + 1] !== "\n") {
+        i++;
       }
       continue;
     }
@@ -748,17 +811,22 @@ function splitOutsideQuotes(str, sepType) {
       i++;
       continue;
     }
-    if (ch === "'" && !inDouble) {
+    if (ch === "'" && !inDouble && !inBacktick) {
       inSingle = !inSingle;
       cur += ch;
       continue;
     }
-    if (ch === '"' && !inSingle) {
+    if (ch === '"' && !inSingle && !inBacktick) {
       inDouble = !inDouble;
       cur += ch;
       continue;
     }
-    if (!inSingle && !inDouble) {
+    if (ch === "`" && !inSingle) {
+      inBacktick = !inBacktick;
+      cur += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble && !inBacktick) {
       if (ch === "<") {
         const hd = matchQuotedHeredocDelim(str, i);
         if (hd) {
@@ -803,7 +871,7 @@ function splitOutsideQuotes(str, sepType) {
         continue;
       }
     }
-    if (!inSingle && !inDouble && arithDepth === 0 && subParenDepth === 0) {
+    if (!inSingle && !inDouble && !inBacktick && arithDepth === 0 && subParenDepth === 0) {
       if (sepType === "clause") {
         if ((ch === "&" && str[i + 1] === "&") || (ch === "|" && str[i + 1] === "|")) {
           if (cur.trim()) parts.push(cur.trim());
@@ -962,7 +1030,7 @@ export function splitShellSegments(command) {
   const inlineExpanded = extractCommandSubstitutions(command, innerSubstitutions);
   const normalized =
     innerSubstitutions.length > 0
-      ? `${inlineExpanded} ; ${innerSubstitutions.join(" ; ")}`
+      ? `${inlineExpanded}\n; ${innerSubstitutions.join(" ; ")}`
       : inlineExpanded;
   const clauses = splitOutsideQuotes(normalized, "clause");
   const segments = [];
@@ -1001,6 +1069,10 @@ export function tokenizeSegment(segment, { preserveLiteralDollar = false } = {})
   while (i < str.length) {
     while (i < str.length && /\s/.test(str[i])) i++;
     if (i >= str.length) break;
+    if (str[i] === "#") {
+      while (i < str.length && str[i] !== "\n") i++;
+      continue;
+    }
     const start = i;
     let end = i;
     while (end < str.length && !/\s/.test(str[end])) {
@@ -2524,12 +2596,16 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     baseCmd === "find"
       ? args.findIndex((a) => a === "-exec" || a === "-execdir" || a === "-ok" || a === "-okdir")
       : -1;
+  const sedOrAwkScripts =
+    baseCmd === "sed" || baseCmd === "awk" ? extractSedOrAwkScripts(baseCmd, args) : null;
   const isExecutablePassive =
     execFlagIdx !== -1 ||
     (baseCmd === "git" &&
       (args.includes("-c") || (args[0] === "bisect" && args[1] === "run"))) ||
-    baseCmd === "awk" ||
-    baseCmd === "sed";
+    (sedOrAwkScripts !== null &&
+      sedOrAwkScripts.some((s) =>
+        matchesAndroidOrAtcText(s, parsed.envVars, STANDALONE_TOOL_REGEX),
+      ));
 
   if (
     (!PASSIVE_NON_EXEC_COMMANDS.has(baseCmd) || isExecutablePassive) &&
@@ -2539,10 +2615,25 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     const searchArgs = args.slice(startSearchIdx);
     const isNodeCmd = baseCmd === "node" || baseCmd === "nodejs";
     const nodeOptValueIndices = new Set();
+    let isNodeNonExecMode = false;
+    let nodeScriptRelIdx = -1;
     if (isNodeCmd) {
+      let sawNodeTest = false;
+      let sawNodeCheck = false;
+      let hasEvalFlag = false;
+      const nodePositional = [];
       for (let i = 0; i < searchArgs.length; i++) {
         const tok = searchArgs[i];
-        if (!tok || tok === "--" || tok === "-") break;
+        if (!tok || tok === "-") break;
+        if (tok === "--") {
+          for (let k = i + 1; k < searchArgs.length; k++) {
+            if (searchArgs[k]) {
+              if (nodeScriptRelIdx === -1) nodeScriptRelIdx = k;
+              nodePositional.push(searchArgs[k]);
+            }
+          }
+          break;
+        }
         if (
           tok === "-e" ||
           tok === "--eval" ||
@@ -2551,7 +2642,16 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
           tok.startsWith("--eval=") ||
           tok.startsWith("--print=")
         ) {
+          hasEvalFlag = true;
           break;
+        }
+        if (tok === "--test" || tok.startsWith("--test=")) {
+          sawNodeTest = true;
+          continue;
+        }
+        if (tok === "--check" || tok === "-c") {
+          sawNodeCheck = true;
+          continue;
         }
         if (NODE_VALUE_FLAGS.has(tok) && i + 1 < searchArgs.length) {
           nodeOptValueIndices.add(i + 1);
@@ -2570,32 +2670,54 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
           continue;
         }
         if (tok.startsWith("-")) continue;
-        break;
+        if (nodeScriptRelIdx === -1) nodeScriptRelIdx = i;
+        nodePositional.push(tok);
+        if (!sawNodeTest && !sawNodeCheck) {
+          break;
+        }
+      }
+      if (
+        !hasEvalFlag &&
+        (sawNodeCheck ||
+          (sawNodeTest &&
+            nodePositional.length > 0 &&
+            nodePositional.every((p) => /(?:\.test|\.spec)\.[A-Za-z0-9]+$/i.test(p))))
+      ) {
+        isNodeNonExecMode = true;
       }
     }
-    const nestedRelIdx = searchArgs.findIndex((a, i) => {
-      if (!a) return false;
-      if (nodeOptValueIndices.has(i)) {
-        return false;
-      }
-      const b = extractExecutableBase(a);
-      return (
-        [
-          "atc",
-          "emulator",
-          "adb",
-          "android",
-          "gradlew",
-          "gradle",
-          "xcrun",
-          "simctl",
-          "devicectl",
-          "xcodebuild",
-        ].includes(b) ||
-        SHELL_WRAPPERS.has(b) ||
-        TRANSPARENT_WRAPPERS.has(b)
-      );
-    });
+    if (isNodeNonExecMode) {
+      return { kind: "ignore", parsed };
+    }
+    const nestedRelIdx =
+      sedOrAwkScripts !== null
+        ? -1
+        : searchArgs.findIndex((a, i) => {
+            if (!a) return false;
+            if (nodeOptValueIndices.has(i)) {
+              return false;
+            }
+            if (isNodeCmd && nodeScriptRelIdx !== -1 && i > nodeScriptRelIdx) {
+              return false;
+            }
+            const b = extractExecutableBase(a);
+            return (
+              [
+                "atc",
+                "emulator",
+                "adb",
+                "android",
+                "gradlew",
+                "gradle",
+                "xcrun",
+                "simctl",
+                "devicectl",
+                "xcodebuild",
+              ].includes(b) ||
+              SHELL_WRAPPERS.has(b) ||
+              TRANSPARENT_WRAPPERS.has(b)
+            );
+          });
     const peelIdx =
       execFlagIdx !== -1 && execFlagIdx + 1 < args.length
         ? execFlagIdx + 1
@@ -2613,7 +2735,9 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         return classifySegment(nestedSegment, parsed.envVars, depth + 1);
       }
     }
-    const embeddedCandidates = extractEmbeddedCommands(args.slice(startSearchIdx));
+    const candidateSourceArgs =
+      sedOrAwkScripts !== null ? sedOrAwkScripts : args.slice(startSearchIdx);
+    const embeddedCandidates = extractEmbeddedCommands(candidateSourceArgs);
     if (embeddedCandidates.length > 0) {
       const embeddedSerials = new Set();
       const baseEmbeddedVars = { ...parsed.envVars };
@@ -2650,6 +2774,109 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   }
 
   return { kind: "ignore", parsed };
+}
+
+function extractSedOrAwkScripts(baseCmd, args) {
+  const explicitScripts = [];
+  const positionalArgs = [];
+  let afterDashDash = false;
+  if (baseCmd === "sed") {
+    for (let i = 0; i < args.length; i++) {
+      const a = String(args[i] ?? "");
+      if (afterDashDash) {
+        positionalArgs.push(a);
+        continue;
+      }
+      if (a === "--") {
+        afterDashDash = true;
+        continue;
+      }
+      if (
+        (a === "-e" || a === "--expression" || a === "-f" || a === "--file") &&
+        i + 1 < args.length
+      ) {
+        explicitScripts.push(String(args[++i] ?? ""));
+        continue;
+      }
+      if (a.startsWith("--expression=") || a.startsWith("--file=")) {
+        explicitScripts.push(a.slice(a.indexOf("=") + 1));
+        continue;
+      }
+      const shortEfMatch = a.match(/^-[nruEsziI]*([ef])(.*)$/);
+      if (shortEfMatch) {
+        if (shortEfMatch[2]) {
+          explicitScripts.push(shortEfMatch[2]);
+        } else if (i + 1 < args.length) {
+          explicitScripts.push(String(args[++i] ?? ""));
+        }
+        continue;
+      }
+      if ((a === "-l" || a === "--line-length") && i + 1 < args.length) {
+        i++;
+        continue;
+      }
+      if (a.startsWith("-") && a.length > 1) {
+        continue;
+      }
+      positionalArgs.push(a);
+    }
+    return explicitScripts.length > 0 ? explicitScripts : positionalArgs.slice(0, 1);
+  }
+  if (baseCmd === "awk") {
+    for (let i = 0; i < args.length; i++) {
+      const a = String(args[i] ?? "");
+      if (afterDashDash) {
+        positionalArgs.push(a);
+        continue;
+      }
+      if (a === "--") {
+        afterDashDash = true;
+        continue;
+      }
+      if (
+        (a === "-e" ||
+          a === "--source" ||
+          a === "-f" ||
+          a === "--file" ||
+          a === "-i" ||
+          a === "--include" ||
+          a === "-l" ||
+          a === "--load" ||
+          a === "-v" ||
+          a === "--assign") &&
+        i + 1 < args.length
+      ) {
+        explicitScripts.push(String(args[++i] ?? ""));
+        continue;
+      }
+      if (
+        a.startsWith("--source=") ||
+        a.startsWith("--file=") ||
+        a.startsWith("--include=") ||
+        a.startsWith("--load=") ||
+        a.startsWith("--assign=")
+      ) {
+        explicitScripts.push(a.slice(a.indexOf("=") + 1));
+        continue;
+      }
+      if ((a.startsWith("-f") || a.startsWith("-e") || a.startsWith("-v")) && a.length > 2) {
+        explicitScripts.push(a.slice(2));
+        continue;
+      }
+      if ((a === "-F" || a === "--field-separator" || a === "-W") && i + 1 < args.length) {
+        i++;
+        continue;
+      }
+      if (a.startsWith("-") && a.length > 1) {
+        continue;
+      }
+      positionalArgs.push(a);
+    }
+    return explicitScripts.length > 0
+      ? [...explicitScripts, ...positionalArgs.slice(0, 1)]
+      : positionalArgs.slice(0, 1);
+  }
+  return args;
 }
 
 function extractEmbeddedCommands(args) {
@@ -4130,13 +4357,23 @@ function rewriteCompoundCommand(
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     if (i < inQuotedHeredocUntil) {
-      if (ch === "\n") {
-        tokens.push({ type: "stage", text: cur });
-        tokens.push({ type: "sep", text: "\n" });
-        cur = "";
-      } else {
-        cur += ch;
+      tokens.push({ type: "sep", text: command.slice(i, inQuotedHeredocUntil) });
+      i = inQuotedHeredocUntil - 1;
+      continue;
+    }
+    if (
+      !inSingle &&
+      !inDouble &&
+      !inBacktick &&
+      subParenDepth === 0 &&
+      arithDepth === 0 &&
+      ch === "#" &&
+      (cur.length === 0 || /(?<!\\)[\s;&|()]$/.test(cur))
+    ) {
+      while (i + 1 < command.length && command[i + 1] !== "\n") {
+        cur += command[i++];
       }
+      cur += command[i];
       continue;
     }
     if (ch === "\\" && !inSingle && i + 1 < command.length) {

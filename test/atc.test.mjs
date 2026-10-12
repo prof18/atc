@@ -696,7 +696,9 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   // A tool name glued into a path, filename, or package spec is not a nested device command
   for (const cmd of [
     "sed -n 430,470p test/atc.test.mjs",
+    "sed -n 1,20p bin/atc.mjs",
     "node --test test/atc.test.mjs",
+    "node --check bin/atc.mjs",
     "copilot plugin install atc@atc",
     `node -e 'require("/repo/atc/com.github.copilot/hooks/hooks.json")'`,
     "node /plugins/review/scripts/render-html.mjs /work/my-android-app/review.json",
@@ -704,8 +706,12 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "bin/search --scope project:my-android-app notes",
     "node scripts/build.mjs --out dist/gradle-report.html",
     "node script.mjs 'a\\\ndb shell'",
+    `node -e 'process.stdout.write("ok")' # a\\\ndb kill-server`,
+    `node -e 'process.stdout.write("ok")' # adb kill-server`,
     "cat <<'EOF'\na\\\ndb shell\nEOF",
     "cat <<EOF\na\\\ndb shell\nEOF",
+    "tee /tmp/script <<EOF\na\\\ndb kill-server\nEOF",
+    "tee /tmp/script <<EOF\nadb kill-server\nEOF",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, true, cmd);
   }
@@ -737,10 +743,13 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "ruby scripts/adb.rb shell pm clear com.x",
     "bash scripts/adb.command shell pm clear com.x",
     "python3 scripts/adb.txt shell getprop",
+    "python3 scripts/adb.foo.bar shell getprop",
     "./adb.log shell getprop",
     "./adb.foo-bar shell getprop",
+    "./adb.foo.bar shell getprop",
     "adb\\\n shell getprop",
     "sh <<EOF\na\\\ndb shell\nEOF",
+    "sh <<'EOF'\na\\\ndb shell\nEOF",
     "cat <<EOF | sh\na\\\ndb shell\nEOF",
     "@adb shell pm clear com.x",
     "npx adb@1.0.0 shell pm clear com.x",
@@ -764,7 +773,9 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "ruby -e 'system(*%w-adb kill-server-)'",
     "python3 scripts/adb.py kill-server",
     "python3 scripts/adb.json kill-server",
+    "python3 scripts/adb.foo.bar kill-server",
     "./adb.foo-bar kill-server",
+    "./adb.foo.bar kill-server",
     "@adb kill-server",
     'cmd.exe /c "@adb kill-server"',
     "npx adb@1.0.0 kill-server",
@@ -775,6 +786,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "npx -p adb@2 -- adb kill-server",
     "pnpm dlx -c adb kill-server",
     "pnpm -C adb@2 exec adb kill-server",
+    "sh <<'EOF'\na\\\ndb kill-server\nEOF",
     `node -e 'require("child_process").spawnSync(process.argv[2],process.argv.slice(3))' -- --title adb kill-server`,
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
@@ -782,8 +794,12 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   for (const cmd of [
     "perl -e 'print q!adb kill-server!'",
     "ruby -e 'puts %q!adb kill-server!'",
+    `node -e 'process.stdout.write("ok")' # a\\\ndb kill-server`,
+    `node -e 'process.stdout.write("ok")' # adb kill-server`,
     "cat <<'EOF'\na\\\ndb shell\nEOF",
     "cat <<EOF\na\\\ndb shell\nEOF",
+    "tee /tmp/script <<EOF\na\\\ndb kill-server\nEOF",
+    "tee /tmp/script <<EOF\nadb kill-server\nEOF",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, true, cmd);
   }
