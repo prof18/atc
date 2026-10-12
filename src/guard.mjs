@@ -600,34 +600,46 @@ function matchQuotedHeredocDelim(str, i) {
     .slice(lineStart, i)
     .trimStart()
     .replace(LEADING_CONTROL_PREFIX_RE, "");
-  const prefixTokens = prefix
-    .trim()
-    .split(/\s+/)
-    .filter((t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
-  while (
-    prefixTokens.length > 0 &&
-    (TRANSPARENT_WRAPPERS.has(extractExecutableBase(prefixTokens[0])) ||
-      prefixTokens[0].startsWith("-"))
-  ) {
-    prefixTokens.shift();
+  const prefixTokens = tokenizeSegment(prefix).filter(
+    (t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t),
+  );
+  while (prefixTokens.length > 0) {
+    const tok = prefixTokens[0];
+    const base = extractExecutableBase(tok);
+    if (TRANSPARENT_WRAPPERS.has(base)) {
+      prefixTokens.shift();
+      while (prefixTokens.length > 0 && prefixTokens[0].startsWith("-")) {
+        const flag = prefixTokens.shift();
+        if (flag === "--") break;
+        if (
+          (WRAPPER_VALUE_FLAGS.has(flag) ||
+            flag === "-C" ||
+            flag === "--chdir" ||
+            flag === "-S" ||
+            flag === "--split-string" ||
+            flag === "--adjustment") &&
+          prefixTokens.length > 0
+        ) {
+          prefixTokens.shift();
+        }
+      }
+      if (
+        base === "timeout" &&
+        prefixTokens.length > 0 &&
+        /^\d+(?:\.\d+)?[smhd]?$/.test(prefixTokens[0])
+      ) {
+        prefixTokens.shift();
+      }
+      continue;
+    }
+    break;
   }
   const firstBase = prefixTokens[0] ? extractExecutableBase(prefixTokens[0]) : "";
-  if (
-    !firstBase ||
-    !PASSIVE_NON_EXEC_COMMANDS.has(firstBase) ||
-    firstBase === "sed" ||
-    firstBase === "awk" ||
-    firstBase === "find" ||
-    firstBase === "git"
-  ) {
+  if (firstBase !== "cat" && firstBase !== "tee") {
     return null;
   }
   const clauseWithoutHeredoc = `${str.slice(lineStart, i)} ${afterDelim}`;
-  const writesFile =
-    />/.test(clauseWithoutHeredoc) ||
-    firstBase === "tee" ||
-    firstBase === "dd" ||
-    firstBase === "cp";
+  const writesFile = />/.test(clauseWithoutHeredoc) || firstBase !== "cat";
   if (writesFile) {
     const bodyStartIdx = lineEnd < str.length ? lineEnd + 1 : lineEnd;
     const { endIdx: heredocEndIdx } = findHeredocBodyBounds(
@@ -635,6 +647,7 @@ function matchQuotedHeredocDelim(str, i) {
       bodyStartIdx,
       delim,
       stripTabs,
+      quoted,
     );
     if (/[;&|]/.test(afterDelim) || str.slice(heredocEndIdx).trim().length > 0) {
       return null;
@@ -643,13 +656,25 @@ function matchQuotedHeredocDelim(str, i) {
   return { endIdx: j, delim, stripTabs, quoted };
 }
 
-function findHeredocBodyBounds(str, bodyStartIdx, delim, stripTabs) {
+function findHeredocBodyBounds(str, bodyStartIdx, delim, stripTabs, quoted = false) {
   let lineStart = bodyStartIdx;
   while (lineStart < str.length) {
     let lineEnd = str.indexOf("\n", lineStart);
     if (lineEnd === -1) lineEnd = str.length;
     let line = str.slice(lineStart, lineEnd);
     if (line.endsWith("\r")) line = line.slice(0, -1);
+    if (!quoted) {
+      while (lineEnd < str.length && /(?<!\\)(?:\\\\)*\\$/.test(line)) {
+        line = line.slice(0, -1);
+        const nextStart = lineEnd + 1;
+        let nextEnd = str.indexOf("\n", nextStart);
+        if (nextEnd === -1) nextEnd = str.length;
+        let nextPart = str.slice(nextStart, nextEnd);
+        if (nextPart.endsWith("\r")) nextPart = nextPart.slice(0, -1);
+        line += nextPart;
+        lineEnd = nextEnd;
+      }
+    }
     const checkLine = stripTabs ? line.replace(/^\t+/, "") : line;
     if (checkLine === delim) {
       let bodyEndIdx = lineStart;
@@ -671,7 +696,13 @@ function resolveQueuedHeredocSpans(str, bodyStartIdx, pendingHeredocs) {
   let cursor = bodyStartIdx;
   for (const hd of pendingHeredocs) {
     if (cursor > str.length) break;
-    const { bodyEndIdx, endIdx } = findHeredocBodyBounds(str, cursor, hd.delim, hd.stripTabs);
+    const { bodyEndIdx, endIdx } = findHeredocBodyBounds(
+      str,
+      cursor,
+      hd.delim,
+      hd.stripTabs,
+      Boolean(hd.quoted),
+    );
     spans.push({
       startIdx: cursor,
       bodyEndIdx,
