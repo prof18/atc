@@ -9,7 +9,7 @@ const TOOL_NAMES_RE_SRC =
 const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%@-]+(?:\\.[A-Za-z0-9_+~%@-]+)*";
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`(?<=.)\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
 const TOOL_WRAPPER_AFFIX_RE = new RegExp(
-  `^(?:[A-Za-z0-9._+~%@-]*[-_.@])?(${GUARDED_TOOL_NAMES_RE_SRC})(?:[._+~%@-][A-Za-z0-9._+~%@-]*)?$`,
+  `(?:^|(?<![A-Za-z0-9]))(${GUARDED_TOOL_NAMES_RE_SRC})(?=$|(?![A-Za-z0-9]))`,
   "i",
 );
 const NPM_VERSION_TAG_RE_SRC =
@@ -20,7 +20,7 @@ const NPM_VERSION_TAG_STRIP_RE = new RegExp(`@${NPM_VERSION_TAG_RE_SRC}$`, "i");
 // `npx @rock3r/atc@2`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a directory segment or fragment
 // of a longer word/identifier (`my-android-app/`, `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
 const STANDALONE_TOOL_REGEX = new RegExp(
-  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_+~%@-])|@${NPM_VERSION_TAG_RE_SRC}(?![A-Za-z0-9_.-]))?(?![A-Za-z0-9_.@/\\\\~%-])|(?<=[/\\\\])(?:[A-Za-z0-9._+~%@-]*@)?${GUARDED_TOOL_NAMES_RE_SRC}(?:@[A-Za-z0-9._+~%@-]+)?(?![A-Za-z0-9_.@/\\\\~%-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
+  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_+~%@-])|@${NPM_VERSION_TAG_RE_SRC}(?![A-Za-z0-9_.-]))?(?![A-Za-z0-9_.@/\\\\~%-])|(?<=[/\\\\])(?:[A-Za-z0-9._+~%@-]*[@+~%]${GUARDED_TOOL_NAMES_RE_SRC}(?:[._+~%@-][A-Za-z0-9._+~%@-]+)?|(?:[A-Za-z0-9._+~%@-]*[-_.@+~%])?${GUARDED_TOOL_NAMES_RE_SRC}[@+~%][A-Za-z0-9._+~%@-]*)(?![A-Za-z0-9_.@/\\\\~%-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
   "i",
 );
 const NODE_VALUE_FLAGS = new Set([
@@ -328,16 +328,26 @@ const TOOL_NAMES = [
 function decodeShellEscapes(str) {
   if (!str || typeof str !== "string" || !str.includes("\\")) return str;
   return str.replace(
-    /\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|0([0-7]{1,3})|([0-7]{1,3})|([abefnrtv\\'"?]))/g,
-    (full, hex, u4, u8, oct0, oct, single) => {
+    /\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|0([0-7]{1,3})|([0-7]{1,3})|c(.)|([abefEnrtv\\'"?]))/g,
+    (full, hex, u4, u8, oct0, oct, ctrl, single) => {
       if (hex) return String.fromCharCode(parseInt(hex, 16));
       if (u4) return String.fromCharCode(parseInt(u4, 16));
       if (u8) return String.fromCodePoint(parseInt(u8, 16));
       if (oct0) return String.fromCharCode(parseInt(oct0, 8));
       if (oct) return String.fromCharCode(parseInt(oct, 8));
+      if (ctrl) {
+        return ctrl === "?"
+          ? "\x7f"
+          : String.fromCharCode(ctrl.toUpperCase().charCodeAt(0) & 0x1f);
+      }
+      if (single === "a") return "\x07";
+      if (single === "b") return "\b";
+      if (single === "e" || single === "E") return "\x1b";
+      if (single === "f") return "\f";
       if (single === "n") return "\n";
       if (single === "r") return "\r";
       if (single === "t") return "\t";
+      if (single === "v") return "\v";
       return single || full;
     },
   );
@@ -611,6 +621,24 @@ function matchQuotedHeredocDelim(str, i) {
     firstBase === "git"
   ) {
     return null;
+  }
+  const clauseWithoutHeredoc = `${str.slice(lineStart, i)} ${afterDelim}`;
+  const writesFile =
+    />/.test(clauseWithoutHeredoc) ||
+    firstBase === "tee" ||
+    firstBase === "dd" ||
+    firstBase === "cp";
+  if (writesFile) {
+    const bodyStartIdx = lineEnd < str.length ? lineEnd + 1 : lineEnd;
+    const { endIdx: heredocEndIdx } = findHeredocBodyBounds(
+      str,
+      bodyStartIdx,
+      delim,
+      stripTabs,
+    );
+    if (/[;&|]/.test(afterDelim) || str.slice(heredocEndIdx).trim().length > 0) {
+      return null;
+    }
   }
   return { endIdx: j, delim, stripTabs, quoted };
 }
