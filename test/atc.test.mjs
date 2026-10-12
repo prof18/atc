@@ -560,6 +560,51 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
     assert.deepEqual(JSON.parse(mcpFreeOtherReply.result.content[0].text).freed, []);
     assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].sessionId, "cp-1");
 
+    // An explicit session override in MCP toolArgs does not leave a stale pending record that poisons another chat's unforwarded call
+    handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: { session: "manual" },
+      }),
+      { ppid: process.pid }
+    );
+    const explicitOverrideReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: { name: "atc_free", arguments: { session: "manual" } },
+      },
+      sharedMcpOpts
+    );
+    assert.equal(explicitOverrideReply.result.isError, false);
+    handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-2",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: {},
+      }),
+      { ppid: process.pid }
+    );
+    const postOverrideUnforwardedReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 22,
+        method: "tools/call",
+        params: { name: "atc_free", arguments: {} },
+      },
+      sharedMcpOpts
+    );
+    assert.equal(postOverrideUnforwardedReply.result.isError, false);
+    assert.deepEqual(JSON.parse(postOverrideUnforwardedReply.result.content[0].text).freed, []);
+
     // Overlapping identical unforwarded MCP calls from cp-1 and cp-2 fail closed as ambiguous
     handlePreToolUseHook(
       dir,

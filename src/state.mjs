@@ -2120,7 +2120,13 @@ export function recordHookSession(
   ).filter(
     (item) => item && typeof item.updatedAtMs === "number" && now - item.updatedAtMs <= 60_000,
   );
-  if (mcpToolName) {
+  const hasExplicitMcpSessionArg = Boolean(
+    mcpToolInput &&
+      typeof mcpToolInput === "object" &&
+      ((typeof mcpToolInput.session === "string" && mcpToolInput.session.trim()) ||
+        (typeof mcpToolInput.role === "string" && mcpToolInput.role.trim())),
+  );
+  if (mcpToolName && !hasExplicitMcpSessionArg) {
     pendingMcpCalls.push({
       sessionId,
       toolName: String(mcpToolName).toLowerCase(),
@@ -2217,12 +2223,17 @@ export function consumePendingMcpHookSession(
       entry.pendingMcpCalls = livePending;
 
       if (explicitSession) {
-        const idx = livePending.findIndex(
+        let idx = livePending.findIndex(
           (item) =>
             item.sessionId === explicitSession &&
             item.toolName === normTool &&
             item.argsKey === argsKey,
         );
+        if (idx === -1) {
+          idx = livePending.findIndex(
+            (item) => item.toolName === normTool && item.argsKey === argsKey,
+          );
+        }
         if (idx !== -1) {
           livePending.splice(idx, 1);
           mutated = true;
