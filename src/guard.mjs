@@ -9,7 +9,7 @@ const TOOL_NAMES_RE_SRC =
 const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%-]+(?:\\.[A-Za-z0-9_+~%-]+)*";
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`(?<=.)\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
 const TOOL_WRAPPER_AFFIX_RE = new RegExp(
-  `^(?:[A-Za-z0-9_+~%-]*[-_.])?(${GUARDED_TOOL_NAMES_RE_SRC})(?:[._+~%-][A-Za-z0-9._+~%-]*)?$`,
+  `^(?:[A-Za-z0-9._+~%-]*[-_.])?(${GUARDED_TOOL_NAMES_RE_SRC})(?:[._+~%-][A-Za-z0-9._+~%-]*)?$`,
   "i",
 );
 const NPM_VERSION_TAG_RE_SRC =
@@ -355,10 +355,17 @@ function extractExecutableBase(
   if (allowPackageSpec || isScopedPkg) {
     file = file.replace(/@[A-Za-z0-9._~^>=<+-]+$/, "");
   }
-  if (/(?:\.test|\.spec)\.[A-Za-z0-9_+~%-]+$/i.test(file)) {
-    return file.toLowerCase();
+  const lowerFile = file.toLowerCase();
+  if (/(?:\.test|\.spec)\.[A-Za-z0-9_+~%-]+$/i.test(lowerFile)) {
+    return lowerFile;
   }
-  const base = file.replace(TOOL_EXEC_EXT_STRIP_RE, "").toLowerCase();
+  if (allowWrapperAffix && !/^emulator-\d+$/i.test(lowerFile)) {
+    const fileAffixMatch = lowerFile.match(TOOL_WRAPPER_AFFIX_RE);
+    if (fileAffixMatch) {
+      return fileAffixMatch[1].toLowerCase();
+    }
+  }
+  const base = lowerFile.replace(TOOL_EXEC_EXT_STRIP_RE, "");
   if (allowWrapperAffix && !/^emulator-\d+$/i.test(base)) {
     const affixMatch = base.match(TOOL_WRAPPER_AFFIX_RE);
     if (affixMatch) {
@@ -538,22 +545,38 @@ function matchQuotedHeredocDelim(str, i) {
     }
   }
   if (!delim || j === start) return null;
-  let lineStart = i;
-  while (
-    lineStart > 0 &&
-    str[lineStart - 1] !== "\n" &&
-    str[lineStart - 1] !== ";" &&
-    str[lineStart - 1] !== "&" &&
-    str[lineStart - 1] !== "|"
-  ) {
-    lineStart--;
+  const fullLineStart = str.lastIndexOf("\n", i - 1) + 1;
+  let lineStart = fullLineStart;
+  let scanParen = 0;
+  let scanSingle = false;
+  let scanDouble = false;
+  for (let k = fullLineStart; k < i; k++) {
+    const c = str[k];
+    if (c === "\\" && !scanSingle && k + 1 < i) {
+      k++;
+      continue;
+    }
+    if (c === "'" && !scanDouble) scanSingle = !scanSingle;
+    else if (c === '"' && !scanSingle) scanDouble = !scanDouble;
+    else if (!scanSingle && !scanDouble) {
+      if (c === "(") scanParen++;
+      else if (c === ")" && scanParen > 0) scanParen--;
+      else if (scanParen === 0 && (c === ";" || c === "&" || c === "|")) {
+        lineStart = k + 1;
+      }
+    }
   }
   let lineEnd = j;
   while (lineEnd < str.length && (str[lineEnd] !== "\n" || str[lineEnd - 1] === "\\")) {
     lineEnd++;
   }
   const afterDelim = str.slice(j, lineEnd);
-  if (/(?:^|[^|])\|(?!\|)/.test(afterDelim)) {
+  const clauseText = str.slice(lineStart, lineEnd);
+  if (
+    /(?:^|[^|])\|(?!\|)/.test(afterDelim) ||
+    />(?:\\\r?\n)*\(/.test(clauseText) ||
+    /__atc_cmd_sub__/.test(clauseText)
+  ) {
     return null;
   }
   const prefix = str

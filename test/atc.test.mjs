@@ -807,7 +807,10 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "./adb-wrapper kill-server",
     "./adb_wrapper kill-server",
     "./my-adb kill-server",
+    "./wrapper.adb kill-server",
     "python3 scripts/adb-wrapper.py kill-server",
+    "cat <<EOF > >(sh)\nadb kill-server\nEOF",
+    "cat <<'EOF' > >(sh)\na\\\ndb kill-server\nEOF",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
   }
@@ -817,7 +820,9 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "cat <<EOF\n$\\\n(adb shell getprop)\nEOF",
     "./adb-wrapper shell getprop",
     "./adb_wrapper shell getprop",
+    "./wrapper.adb shell getprop",
     "python3 scripts/adb-wrapper.py shell getprop",
+    "cat <<EOF > >(sh)\nadb shell getprop\nEOF",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
@@ -844,6 +849,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   assert.equal(
     wrapperLeasedRes.rewrittenCommand,
     "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./adb-wrapper shell getprop",
+  );
+  const dotWrapperLeasedRes = evaluateCommandGuard("./wrapper.adb shell getprop", {
+    ...leasedOpts,
+    platform: "linux",
+  });
+  assert.equal(dotWrapperLeasedRes.allowed, true);
+  assert.equal(
+    dotWrapperLeasedRes.rewrittenCommand,
+    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./wrapper.adb shell getprop",
   );
   const heredocSubRes = evaluateCommandGuard(
     "cat <<EOF\n$(adb shell getprop ro.build.version.release)\nEOF",
