@@ -2,11 +2,11 @@ import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
 // Stricter than FAST_PATH_REGEX: the tool name must be a standalone token or executable basename
-// (`adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a
-// directory segment or fragment of a longer word/identifier (`my-android-app/`, `atc.test.mjs`,
+// (`adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `bin/atc.mjs`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`),
+// not a directory segment or fragment of a longer word/identifier (`my-android-app/`, `atc.test.mjs`,
 // `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
 const STANDALONE_TOOL_REGEX =
-  /(?:(?<![A-Za-z0-9_.@-])(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd)(?![A-Za-z0-9_]))?(?![A-Za-z0-9_.@/\\-])|(?:\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\s*([^\w\s])\s*(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd))?(?=\s|\2))/i;
+  /(?:(?<![A-Za-z0-9_.@-])(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd|com|ps1|sh|mjs|cjs|js)(?![A-Za-z0-9_]))?(?![A-Za-z0-9_.@/\\-])|(?:\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\s*([^\w\s])\s*(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd|com|ps1|sh|mjs|cjs|js))?(?=\s|\2))/i;
 const TRANSPARENT_WRAPPERS = new Set([
   "env",
   "command",
@@ -190,7 +190,6 @@ function decodeShellEscapes(str) {
 
 function extractExecutableBase(tok) {
   if (!tok || typeof tok !== "string") return "";
-  if (/[;`()[\]{}<>]/.test(tok)) return "";
   const file = tok.split(/[\\/]/).pop() || "";
   if (!file || /[\s"'`();|&[\]{},<>]/.test(file)) return "";
   return file.replace(/\.(?:exe|bat|cmd|com|ps1|sh|mjs|cjs|js)$/i, "").toLowerCase();
@@ -2093,7 +2092,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   ) {
     const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
     const nestedRelIdx = args.slice(startSearchIdx).findIndex((a) => {
-      if (!a || /\s/.test(a)) return false;
+      if (!a) return false;
       const b = extractExecutableBase(a);
       return (
         [
@@ -2179,6 +2178,16 @@ function extractEmbeddedCommands(args) {
     let m;
     while ((m = litRe.exec(arg)) !== null) {
       const lit = m[1] ?? m[2] ?? m[3] ?? "";
+      if (lit) literals.push(lit);
+    }
+    const quoteLikeSymRe = /(?:\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\s*([^\w\s()[\]{}<>])([\s\S]*?)\1/g;
+    while ((m = quoteLikeSymRe.exec(arg)) !== null) {
+      if (m[2]) literals.push(m[2]);
+    }
+    const quoteLikeBrkRe =
+      /(?:\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\s*(?:\(([^)]*)\)|\[([^\]]*)\]|\{([^}]*)\}|<([^>]*)>)/g;
+    while ((m = quoteLikeBrkRe.exec(arg)) !== null) {
+      const lit = m[1] ?? m[2] ?? m[3] ?? m[4] ?? "";
       if (lit) literals.push(lit);
     }
     for (const lit of literals) {

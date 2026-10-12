@@ -725,9 +725,26 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "perl -e 'qx/adb shell pm clear com.x/'",
     "ruby -e '%x+adb shell pm clear com.x+'",
     "ruby -e 'system(*%w-adb shell input tap 1 1-)'",
+    `"/opt/Android SDK (tools)/platform-tools/adb" shell getprop`,
+    `"C:\\\\Program Files (x86)\\\\Android\\\\android-sdk\\\\platform-tools\\\\adb.exe" shell getprop`,
+    "node scripts/adb.js shell pm clear com.x",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
+  const leasedOpts = {
+    sessionId: "sess-leased",
+    activeLeases: [{ serial: "emulator-5554", platform: "android" }],
+    runningCount: 1,
+  };
+  for (const cmd of [
+    `xargs "/opt/Android SDK/platform-tools/adb" kill-server </dev/null`,
+    "perl -e 'qx!adb kill-server!'",
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
+  }
+  const atcRes = evaluateCommandGuard("node bin/atc.mjs free", opts);
+  assert.equal(atcRes.allowed, true);
+  assert.match(atcRes.rewrittenCommand || "", /ATC_SESSION_ID=sess-unleased/);
 });
 
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
