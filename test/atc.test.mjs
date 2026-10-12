@@ -440,6 +440,111 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
   );
 });
 
+test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
+  const dir = makeTempStateDir();
+  try {
+    // Non-shell tools and non-device shell commands pass through silently
+    const viewAllow = handlePreToolUseHook(
+      dir,
+      JSON.stringify({ sessionId: "cp-1", toolName: "view", toolArgs: { path: "README.md" } }),
+      { ppid: process.pid }
+    );
+    assert.equal(viewAllow.exitCode, 0);
+    assert.equal(viewAllow.stdout, "");
+
+    // Unleased adb is denied with Copilot's permissionDecision shape (toolArgs as JSON string)
+    const deny = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        cwd: process.cwd(),
+        toolName: "bash",
+        toolArgs: JSON.stringify({ command: "adb shell pm list packages" }),
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(deny.exitCode, 2);
+    const denyOut = JSON.parse(deny.stdout);
+    assert.equal(denyOut.permissionDecision, "deny");
+    assert.match(denyOut.permissionDecisionReason, /atc/);
+    assert.equal(denyOut.hookSpecificOutput, undefined);
+
+    // `atc claim` is rewritten via modifiedArgs, preserving other tool args (toolArgs as object)
+    const rewrite = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        toolName: "bash",
+        toolArgs: { command: "atc claim --type phone", description: "claim" },
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(rewrite.exitCode, 0);
+    const rewriteOut = JSON.parse(rewrite.stdout);
+    assert.equal(rewriteOut.permissionDecision, "allow");
+    assert.equal(rewriteOut.modifiedArgs.description, "claim");
+    assert.match(rewriteOut.modifiedArgs.command, /(?:ATC_SESSION_ID=cp-1|--session cp-1)/);
+
+    // sessionEnd with reason "complete" fires after every Copilot turn: keep the lease.
+    // A terminal reason (user_exit/abort/error/timeout) releases it.
+    cmdClaim(
+      dir,
+      { session: "cp-1", avd: "Pixel_8_API_35" },
+      {
+        inventory: {
+          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+          running: [
+            {
+              deviceKey: "avd:Pixel_8_API_35",
+              avd: "Pixel_8_API_35",
+              serial: "emulator-5554",
+              kind: "emulator",
+              online: true,
+              profile: { deviceType: "phone", apiLevel: "android-35" },
+            },
+          ],
+          offline: [],
+          creatable: [],
+        },
+      }
+    );
+    const stopOpts = {
+      ppid: process.pid,
+      host: { freeDiskMb: 65536 },
+      runner: () => ({ status: 0, stdout: "OK", stderr: "" }),
+    };
+    const turnEnd = handleStopHook(
+      dir,
+      JSON.stringify({ sessionId: "cp-1", cwd: process.cwd(), reason: "complete" }),
+      stopOpts
+    );
+    assert.deepEqual(turnEnd.freed, []);
+    const userExit = handleStopHook(
+      dir,
+      JSON.stringify({ sessionId: "cp-1", cwd: process.cwd(), reason: "user_exit" }),
+      stopOpts
+    );
+    assert.equal(userExit.exitCode, 0);
+    assert.equal(userExit.freed.length, 1);
+
+    // Copilot hook manifest exists where Agent Plugins 1.0 loads it, and MCP config at root mcp.json
+    const rootDir = new URL("../", import.meta.url);
+    const copilotHooks = JSON.parse(
+      fs.readFileSync(new URL("com.github.copilot/hooks/hooks.json", rootDir), "utf8")
+    );
+    assert.equal(copilotHooks.version, 1);
+    assert.match(copilotHooks.hooks.preToolUse[0].command, /'hook', 'PreToolUse'/);
+    assert.match(copilotHooks.hooks.sessionEnd[0].command, /'hook', 'SessionEnd'/);
+    // Agent Plugins 1.0 skips a root mcp.json without the matching $schema; stdio needs explicit type
+    const mcp = JSON.parse(fs.readFileSync(new URL("mcp.json", rootDir), "utf8"));
+    assert.equal(mcp.$schema, "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json");
+    assert.equal(mcp.mcpServers.atc.type, "stdio");
+    assert.equal(mcp.mcpServers.atc.command, "atc");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
   const dir = makeTempStateDir();
   try {

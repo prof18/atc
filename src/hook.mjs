@@ -64,6 +64,28 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
     };
   }
 
+  // GitHub Copilot CLI native format (camelCase `toolName` + `toolArgs`, object or JSON string)
+  if (typeof payload.toolName === "string" && "toolArgs" in payload && !payload.tool_input) {
+    let toolArgs = payload.toolArgs;
+    if (typeof toolArgs === "string") {
+      try {
+        toolArgs = JSON.parse(toolArgs);
+      } catch {
+        toolArgs = {};
+      }
+    }
+    if (!toolArgs || typeof toolArgs !== "object") toolArgs = {};
+    const rawSession = payload.sessionId || payload.session_id || `ppid-${ppid}`;
+    return {
+      hostFormat: "copilot",
+      isShellTool: /^(bash|shell)$/i.test(payload.toolName),
+      command: typeof toolArgs.command === "string" ? toolArgs.command : "",
+      sessionId: sanitizeSessionId(rawSession, ppid),
+      anchorPid: ppid,
+      toolInput: toolArgs,
+    };
+  }
+
   // Claude Code / Codex format
   const toolName = String(payload.tool_name || payload.toolName || "");
   const toolInput = payload.tool_input || payload.input || {};
@@ -275,15 +297,17 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
               user_message: evalResult.reason,
               agent_message: evalResult.reason,
             }
-          : {
-              decision: "block",
-              reason: evalResult.reason,
-              hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "deny",
-                permissionDecisionReason: evalResult.reason,
-              },
-            };
+          : norm.hostFormat === "copilot"
+            ? { permissionDecision: "deny", permissionDecisionReason: evalResult.reason }
+            : {
+                decision: "block",
+                reason: evalResult.reason,
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "deny",
+                  permissionDecisionReason: evalResult.reason,
+                },
+              };
     return {
       exitCode: 2,
       stdout: JSON.stringify(denyJson) + "\n",
@@ -299,16 +323,21 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
               CommandLine: evalResult.rewrittenCommand,
             },
           }
-        : {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
+        : norm.hostFormat === "copilot"
+          ? {
               permissionDecision: "allow",
-              updatedInput: {
-                ...norm.toolInput,
-                command: evalResult.rewrittenCommand,
+              modifiedArgs: { ...norm.toolInput, command: evalResult.rewrittenCommand },
+            }
+          : {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "allow",
+                updatedInput: {
+                  ...norm.toolInput,
+                  command: evalResult.rewrittenCommand,
+                },
               },
-            },
-          };
+            };
     return {
       exitCode: 0,
       stdout: JSON.stringify(allowJson) + "\n",
@@ -322,6 +351,12 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
 export function handleStopHook(stateDir, rawStdin, options = {}) {
   const payload = typeof rawStdin === "string" ? parseHookInput(rawStdin) : rawStdin;
   if (payload && payload.fullyIdle === false) {
+    return { exitCode: 0, freed: [] };
+  }
+  // GitHub Copilot fires sessionEnd with reason "complete" after every agent turn while the
+  // session stays open (same sessionId, same host process). Keep the lease; TTL expiry and
+  // dead-anchor GC reclaim it if the session never sends a terminal reason.
+  if (payload && payload.reason === "complete") {
     return { exitCode: 0, freed: [] };
   }
   const rawPpid = options.ppid ?? process.ppid;
