@@ -764,6 +764,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     `node --check --import 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' main.js`,
     "node --check -r ./adb.js main.js",
     "NODE_OPTIONS='--require ./adb.js' node --check main.js",
+    `node --test --test-reporter='data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
+    `node --test --test-reporter 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
@@ -787,6 +789,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "cmd /c echo # & adb kill-server",
     `node --check --import 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' main.js`,
     `NODE_OPTIONS='--import "data:text/javascript,import(\\"node:child_process\\").then(cp=>cp.execSync(\\"adb kill-server\\"))"' node --check main.js`,
+    `node --test --test-reporter='data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
+    `node --test --test-reporter 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
     "npx adb@1.0.0 kill-server",
     "npx @scope/adb@2 kill-server",
     "npm exec -c 'adb kill-server'",
@@ -829,6 +833,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   assert.equal(
     heredocSingleQuoteSubRes.rewrittenCommand,
     "cat <<EOF\n'$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)'\nEOF",
+  );
+  const multiHeredocSubRes = evaluateCommandGuard(
+    "cat <<EOF1 <<'EOF2'\n$(adb shell getprop ro.build.version.release)\nEOF1\n$(adb shell getprop ro.build.version.sdk)\nEOF2",
+    { ...leasedOpts, platform: "linux" },
+  );
+  assert.equal(multiHeredocSubRes.allowed, true);
+  assert.equal(
+    multiHeredocSubRes.rewrittenCommand,
+    "cat <<EOF1 <<'EOF2'\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF1\n$(adb shell getprop ro.build.version.sdk)\nEOF2",
   );
   const atcRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "linux" });
   assert.equal(atcRes.allowed, true);

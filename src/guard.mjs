@@ -558,13 +558,29 @@ function findHeredocBodyEnd(str, bodyStartIdx, delim, stripTabs) {
   return str.length;
 }
 
+function resolveQueuedHeredocSpans(str, bodyStartIdx, pendingHeredocs) {
+  const spans = [];
+  let cursor = bodyStartIdx;
+  for (const hd of pendingHeredocs) {
+    if (cursor > str.length) break;
+    const endIdx = findHeredocBodyEnd(str, cursor, hd.delim, hd.stripTabs);
+    spans.push({
+      startIdx: cursor,
+      endIdx,
+      quoted: Boolean(hd.quoted),
+    });
+    cursor = endIdx < str.length && str[endIdx] === "\n" ? endIdx + 1 : endIdx;
+  }
+  return spans;
+}
+
 function stripLineContinuations(str, { allowHashComments = true } = {}) {
   if (!str || typeof str !== "string" || !str.includes("\\")) return str;
   let out = "";
   let inSingle = false;
   let inDouble = false;
   let inBacktick = false;
-  let pendingHeredoc = null;
+  const pendingHeredocs = [];
   let inQuotedHeredocUntil = -1;
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
@@ -604,20 +620,16 @@ function stripLineContinuations(str, { allowHashComments = true } = {}) {
     if (!inSingle && !inDouble && ch === "<") {
       const hd = matchQuotedHeredocDelim(str, i);
       if (hd) {
-        pendingHeredoc = hd;
+        pendingHeredocs.push(hd);
         out += str.slice(i, hd.endIdx);
         i = hd.endIdx - 1;
         continue;
       }
     }
-    if (!inSingle && !inDouble && ch === "\n" && pendingHeredoc) {
-      inQuotedHeredocUntil = findHeredocBodyEnd(
-        str,
-        i + 1,
-        pendingHeredoc.delim,
-        pendingHeredoc.stripTabs,
-      );
-      pendingHeredoc = null;
+    if (!inSingle && !inDouble && ch === "\n" && pendingHeredocs.length > 0) {
+      const spans = resolveQueuedHeredocSpans(str, i + 1, pendingHeredocs);
+      inQuotedHeredocUntil = spans[spans.length - 1].endIdx;
+      pendingHeredocs.length = 0;
       out += ch;
       continue;
     }
@@ -790,7 +802,7 @@ function splitOutsideQuotes(str, sepType, { allowHashComments = true } = {}) {
   let inBacktick = false;
   let arithDepth = 0;
   let subParenDepth = 0;
-  let pendingHeredoc = null;
+  const pendingHeredocs = [];
   let inQuotedHeredocUntil = -1;
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
@@ -845,7 +857,7 @@ function splitOutsideQuotes(str, sepType, { allowHashComments = true } = {}) {
       if (ch === "<") {
         const hd = matchQuotedHeredocDelim(str, i);
         if (hd) {
-          pendingHeredoc = hd;
+          pendingHeredocs.push(hd);
         }
       }
       if (arithDepth === 0 && ch === "$" && str[i + 1] === "(" && str[i + 2] === "(") {
@@ -912,14 +924,10 @@ function splitOutsideQuotes(str, sepType, { allowHashComments = true } = {}) {
             str[i - 1] !== "<" &&
             str[i - 1] !== "|")
         ) {
-          if (ch === "\n" && pendingHeredoc) {
-            inQuotedHeredocUntil = findHeredocBodyEnd(
-              str,
-              i + 1,
-              pendingHeredoc.delim,
-              pendingHeredoc.stripTabs,
-            );
-            pendingHeredoc = null;
+          if (ch === "\n" && pendingHeredocs.length > 0) {
+            const spans = resolveQueuedHeredocSpans(str, i + 1, pendingHeredocs);
+            inQuotedHeredocUntil = spans[spans.length - 1].endIdx;
+            pendingHeredocs.length = 0;
           }
           if (cur.trim()) parts.push(cur.trim());
           cur = "";
@@ -950,12 +958,21 @@ function extractCommandSubstitutions(str, innerSubstitutions) {
   let out = "";
   let inSingle = false;
   let inDouble = false;
-  let pendingHeredoc = null;
-  let inUnquotedHeredocUntil = -1;
+  const pendingHeredocs = [];
+  let heredocSpans = [];
 
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
-    const inUnquotedHeredoc = i < inUnquotedHeredocUntil;
+    const activeHeredocSpan =
+      heredocSpans.length > 0
+        ? heredocSpans.find((sp) => i >= sp.startIdx && i < sp.endIdx) || null
+        : null;
+    if (activeHeredocSpan && activeHeredocSpan.quoted) {
+      out += str.slice(i, activeHeredocSpan.endIdx);
+      i = activeHeredocSpan.endIdx - 1;
+      continue;
+    }
+    const inUnquotedHeredoc = Boolean(activeHeredocSpan && !activeHeredocSpan.quoted);
     if (ch === "\\" && !inSingle && i + 1 < str.length) {
       out += ch + str[i + 1];
       i++;
@@ -974,17 +991,12 @@ function extractCommandSubstitutions(str, innerSubstitutions) {
     if (!inUnquotedHeredoc && !inSingle && !inDouble) {
       if (ch === "<") {
         const hd = matchQuotedHeredocDelim(str, i);
-        if (hd && !hd.quoted) {
-          pendingHeredoc = hd;
+        if (hd) {
+          pendingHeredocs.push(hd);
         }
-      } else if (ch === "\n" && pendingHeredoc) {
-        inUnquotedHeredocUntil = findHeredocBodyEnd(
-          str,
-          i + 1,
-          pendingHeredoc.delim,
-          pendingHeredoc.stripTabs,
-        );
-        pendingHeredoc = null;
+      } else if (ch === "\n" && pendingHeredocs.length > 0) {
+        heredocSpans = resolveQueuedHeredocSpans(str, i + 1, pendingHeredocs);
+        pendingHeredocs.length = 0;
       }
     }
     if (
@@ -2014,7 +2026,7 @@ export function classifySegment(
   }
 
   // Precedence 1: ATC commands (`atc ...`)
-  if (baseCmd === "atc") {
+  if (baseCmd === "atc" && !/(?:\.test|\.spec)\.[A-Za-z0-9_+~%-]+$/i.test(parsed.cmd)) {
     let subIdx = 0;
     let atcSerialFlag = null;
     while (subIdx < args.length) {
@@ -2681,11 +2693,13 @@ export function classifySegment(
     const nodeOptValueIndices = new Set();
     let isNodeNonExecMode = false;
     let nodeScriptRelIdx = -1;
+    let canPeelNodeScript = false;
     if (isNodeCmd) {
       let sawNodeTest = false;
       let sawNodeCheck = false;
       let hasEvalFlag = false;
       let hasPreloadFlag = Boolean(parsed.envVars?.NODE_OPTIONS);
+      let hasOtherNodeFlag = false;
       const nodePositional = [];
       for (let i = 0; i < searchArgs.length; i++) {
         const tok = searchArgs[i];
@@ -2710,7 +2724,7 @@ export function classifySegment(
           hasEvalFlag = true;
           break;
         }
-        if (tok === "--test" || tok.startsWith("--test=")) {
+        if (tok === "--test") {
           sawNodeTest = true;
           continue;
         }
@@ -2719,6 +2733,7 @@ export function classifySegment(
           continue;
         }
         if (NODE_VALUE_FLAGS.has(tok) && i + 1 < searchArgs.length) {
+          hasOtherNodeFlag = true;
           nodeOptValueIndices.add(i + 1);
           i += 1;
           continue;
@@ -2747,7 +2762,10 @@ export function classifySegment(
           hasPreloadFlag = true;
           continue;
         }
-        if (tok.startsWith("-")) continue;
+        if (tok.startsWith("-")) {
+          hasOtherNodeFlag = true;
+          continue;
+        }
         if (nodeScriptRelIdx === -1) nodeScriptRelIdx = i;
         nodePositional.push(tok);
         if (!sawNodeTest && !sawNodeCheck) {
@@ -2757,6 +2775,7 @@ export function classifySegment(
       if (
         !hasEvalFlag &&
         !hasPreloadFlag &&
+        !hasOtherNodeFlag &&
         (sawNodeCheck ||
           (sawNodeTest &&
             nodePositional.length > 0 &&
@@ -2764,6 +2783,11 @@ export function classifySegment(
       ) {
         isNodeNonExecMode = true;
       }
+      canPeelNodeScript =
+        !hasEvalFlag &&
+        !hasPreloadFlag &&
+        !sawNodeTest &&
+        !sawNodeCheck;
     }
     if (isNodeNonExecMode) {
       return { kind: "ignore", parsed };
@@ -2776,8 +2800,13 @@ export function classifySegment(
             if (nodeOptValueIndices.has(i)) {
               return false;
             }
-            if (isNodeCmd && nodeScriptRelIdx !== -1 && i > nodeScriptRelIdx) {
-              return false;
+            if (isNodeCmd) {
+              if (nodeScriptRelIdx !== -1 && i > nodeScriptRelIdx) {
+                return false;
+              }
+              if (/(?:\.test|\.spec)\.[A-Za-z0-9_+~%-]+$/i.test(a)) {
+                return false;
+              }
             }
             const b = extractExecutableBase(a);
             return (
@@ -2803,6 +2832,7 @@ export function classifySegment(
         : nestedRelIdx !== -1
           ? startSearchIdx + nestedRelIdx
           : -1;
+    let peeledClass = null;
     if (peelIdx !== -1) {
       const cleanedArgs = args
         .slice(peelIdx)
@@ -2811,7 +2841,10 @@ export function classifySegment(
         const nestedSegment = cleanedArgs
           .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
-        return classifySegment(nestedSegment, parsed.envVars, depth + 1);
+        peeledClass = classifySegment(nestedSegment, parsed.envVars, depth + 1);
+        if (peeledClass.kind === "deny_lifecycle") {
+          return peeledClass;
+        }
       }
     }
     const candidateSourceArgs =
@@ -2849,6 +2882,9 @@ export function classifySegment(
           parsed,
         };
       }
+    }
+    if (peeledClass && (!isNodeCmd || canPeelNodeScript || peeledClass.kind === "device_action")) {
+      return peeledClass;
     }
     return {
       kind: "device_action",
@@ -4437,18 +4473,34 @@ function rewriteCompoundCommand(
   let inBacktick = false;
   let subParenDepth = 0;
   let arithDepth = 0;
-  let pendingHeredoc = null;
-  let inQuotedHeredocUntil = -1;
-  let inHeredocQuoted = false;
+  const pendingHeredocs = [];
+  let pendingHeredocSpans = null;
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
-    if (i < inQuotedHeredocUntil) {
-      tokens.push({
-        type: "heredoc_body",
-        text: command.slice(i, inQuotedHeredocUntil),
-        quoted: inHeredocQuoted,
-      });
-      i = inQuotedHeredocUntil - 1;
+    if (
+      pendingHeredocSpans &&
+      pendingHeredocSpans.length > 0 &&
+      i === pendingHeredocSpans[0].startIdx
+    ) {
+      for (let sIdx = 0; sIdx < pendingHeredocSpans.length; sIdx++) {
+        const sp = pendingHeredocSpans[sIdx];
+        tokens.push({
+          type: "heredoc_body",
+          text: command.slice(sp.startIdx, sp.endIdx),
+          quoted: sp.quoted,
+        });
+        if (sIdx + 1 < pendingHeredocSpans.length) {
+          const nextSp = pendingHeredocSpans[sIdx + 1];
+          if (sp.endIdx < nextSp.startIdx) {
+            tokens.push({
+              type: "sep",
+              text: command.slice(sp.endIdx, nextSp.startIdx),
+            });
+          }
+        }
+      }
+      i = pendingHeredocSpans[pendingHeredocSpans.length - 1].endIdx - 1;
+      pendingHeredocSpans = null;
       continue;
     }
     if (
@@ -4492,7 +4544,7 @@ function rewriteCompoundCommand(
         if (!inDouble && ch === "<") {
           const hd = matchQuotedHeredocDelim(command, i);
           if (hd) {
-            pendingHeredoc = hd;
+            pendingHeredocs.push(hd);
           }
         }
         if (!inDouble && arithDepth === 0 && ch === "$" && command[i + 1] === "(" && command[i + 2] === "(") {
@@ -4560,15 +4612,13 @@ function rewriteCompoundCommand(
         continue;
       }
       if (ch === "\n") {
-        if (pendingHeredoc) {
-          inQuotedHeredocUntil = findHeredocBodyEnd(
+        if (pendingHeredocs.length > 0) {
+          pendingHeredocSpans = resolveQueuedHeredocSpans(
             command,
             i + 1,
-            pendingHeredoc.delim,
-            pendingHeredoc.stripTabs,
+            pendingHeredocs,
           );
-          inHeredocQuoted = Boolean(pendingHeredoc.quoted);
-          pendingHeredoc = null;
+          pendingHeredocs.length = 0;
         }
         tokens.push({ type: "stage", text: cur });
         tokens.push({ type: "sep", text: "\n" });
