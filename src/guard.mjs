@@ -1,6 +1,11 @@
 import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
+// Stricter than FAST_PATH_REGEX: the tool name must be a standalone shell word or an executable path
+// (`adb`, `/usr/bin/adb`, `"adb shell"`, `adb.exe`), not a fragment of a longer word such as
+// `my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, or `atc@atc`.
+const STANDALONE_TOOL_REGEX =
+  /(?:^|[\s"'`(;|&=/[{,])(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd))?(?=$|[\s"'`);|&\]},])/i;
 const TRANSPARENT_WRAPPERS = new Set([
   "env",
   "command",
@@ -281,20 +286,20 @@ function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") 
   return "__atc_cmd_sub__";
 }
 
-function matchesAndroidOrAtcText(str, inheritedVars = {}) {
+function matchesAndroidOrAtcText(str, inheritedVars = {}, toolRegex = FAST_PATH_REGEX) {
   if (!str || typeof str !== "string") return false;
-  if (FAST_PATH_REGEX.test(str)) return true;
+  if (toolRegex.test(str)) return true;
   const subExpanded =
     str.includes("$") || str.includes("`") ? extractCommandSubstitutions(str, []) : str;
   const ansiDecoded = subExpanded.replace(/\$'((?:\\.|[^'])*)'/g, (_m, inner) =>
     decodeShellEscapes(inner),
   );
-  if (FAST_PATH_REGEX.test(ansiDecoded)) return true;
+  if (toolRegex.test(ansiDecoded)) return true;
   const normalizedVars = ansiDecoded.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
   const collapsed = decodeShellEscapes(normalizedVars)
     .replace(/\\(.)/g, "$1")
     .replace(/["']/g, "");
-  if (FAST_PATH_REGEX.test(collapsed)) return true;
+  if (toolRegex.test(collapsed)) return true;
   let expandedForCmdCheck = collapsed;
   if (collapsed.includes("$")) {
     const vars = { ...inheritedVars };
@@ -305,7 +310,7 @@ function matchesAndroidOrAtcText(str, inheritedVars = {}) {
     }
     let expanded = expandVariables(collapsed, vars);
     expanded = expandVariables(expanded, vars);
-    if (FAST_PATH_REGEX.test(expanded)) return true;
+    if (toolRegex.test(expanded)) return true;
     expandedForCmdCheck = expanded;
   }
   if (expandedForCmdCheck.includes("__atc_cmd_sub__")) {
@@ -2073,7 +2078,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
   if (
     (!PASSIVE_NON_EXEC_COMMANDS.has(baseCmd) || isExecutablePassive) &&
-    matchesAndroidOrAtcText(effectiveSegment, parsed.envVars)
+    matchesAndroidOrAtcText(effectiveSegment, parsed.envVars, STANDALONE_TOOL_REGEX)
   ) {
     const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
     const nestedRelIdx = args.slice(startSearchIdx).findIndex((a) => {

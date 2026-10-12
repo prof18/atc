@@ -691,6 +691,37 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
   }
 });
 
+test("guard: tool names embedded in paths or longer words do not fail closed", () => {
+  const opts = { sessionId: "sess-unleased", activeLeases: [], runningCount: 1 };
+  // A tool name glued into a path, filename, or package spec is not a nested device command
+  for (const cmd of [
+    "sed -n 430,470p test/atc.test.mjs",
+    "node --test test/atc.test.mjs",
+    "copilot plugin install atc@atc",
+    `node -e 'require("/repo/atc/com.github.copilot/hooks/hooks.json")'`,
+    "node /plugins/review/scripts/render-html.mjs /work/my-android-app/review.json",
+    "python3 render.py --root /work/my-android-app",
+    "bin/search --scope project:my-android-app notes",
+    "node scripts/build.mjs --out dist/gradle-report.html",
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, opts).allowed, true, cmd);
+  }
+  // Standalone tool words inside interpreters and executable-passive tools still fail closed
+  for (const cmd of [
+    `node -e 'require("child_process").execSync("adb shell pm clear com.x")'`,
+    `node -e 'require("child_process").execSync("/opt/sdk/platform-tools/adb shell pm clear com.x")'`,
+    `node -e 'require("child_process").execSync("a""db shell pm clear com.x")'`,
+    `python3 -c "import os; os.system('adb shell pm clear com.x')"`,
+    `python3 -c "import subprocess; subprocess.run(['adb','shell','pm','clear','com.x'])"`,
+    `sed -n 'e adb shell pm clear com.x' /dev/null`,
+    `perl -e 'system("adb.exe shell input tap 1 1")'`,
+    "node -e 'spawn(...[adb,shell,input])'",
+    "ruby -e 'system(%w{adb shell input tap 1 1})'",
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
+  }
+});
+
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
   const dir = makeTempStateDir();
   try {
