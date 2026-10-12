@@ -81,6 +81,37 @@ const NODE_VALUE_FLAGS = new Set([
   "--debug-port",
   "--inspect-publish-uid",
 ]);
+const WRAPPER_VALUE_FLAGS = new Set([
+  ...NODE_VALUE_FLAGS,
+  "-p",
+  "--package",
+  "-w",
+  "--workspace",
+  "--prefix",
+  "--shell",
+  "--userconfig",
+  "--cache",
+  "--registry",
+  "-u",
+  "--unset",
+  "--chdir",
+  "-g",
+  "-D",
+  "-R",
+  "-T",
+  "-k",
+  "-s",
+  "-n",
+  "-o",
+  "+o",
+  "--rcfile",
+  "--init-file",
+  "-r",
+  "--require",
+  "--import",
+  "--loader",
+  "--experimental-loader",
+]);
 const TRANSPARENT_WRAPPERS = new Set([
   "env",
   "command",
@@ -4878,12 +4909,14 @@ function rewriteCompoundCommand(
             `((?:^|[\\s=])["']?${escapedCmd}["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|["']|$)`,
             "gi",
           );
+          const preBoundaryRe = new RegExp(`^\\s+--\\s+.*\\b${escapedCmd}\\b`, "i");
           let match;
           let chosenMatch = null;
           while ((match = cmdRe.exec(trimmed)) !== null) {
             const before = trimmed.slice(0, match.index).trimEnd();
             const prevTok = before.split(/\s+/).pop() || "";
-            if (NODE_VALUE_FLAGS.has(prevTok) || prevTok === "-p" || prevTok === "--package") {
+            const after = trimmed.slice(match.index + match[0].length);
+            if (WRAPPER_VALUE_FLAGS.has(prevTok) || preBoundaryRe.test(after)) {
               cmdRe.lastIndex = match.index + 1;
               continue;
             }

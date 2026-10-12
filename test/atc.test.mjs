@@ -810,6 +810,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     atcNpmPkgWinRes.rewrittenCommand,
     "npm exec --package @rock3r/atc@2 -- atc free --session sess-unleased",
   );
+  const atcNpmWsWinRes = evaluateCommandGuard("npm exec --workspace atc -- atc free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcNpmWsWinRes.allowed, true);
+  assert.equal(
+    atcNpmWsWinRes.rewrittenCommand,
+    "npm exec --workspace atc -- atc free --session sess-unleased",
+  );
   const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
   assert.equal(atcWinRes.allowed, true);
   assert.match(atcWinRes.rewrittenCommand || "", /--session sess-unleased/);
