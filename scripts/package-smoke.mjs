@@ -98,6 +98,8 @@ try {
     [".agents", "plugins", "marketplace.json"],
     [".claude-plugin", "marketplace.json"],
     [".mcp.json"],
+    ["mcp.json"],
+    ["com.github.copilot", "hooks", "hooks.json"],
     ["skills", "atc", "SKILL.md"],
     ["skills", "atc", "skill-source.json"],
     ["skills", "atc", "references", "install.md"],

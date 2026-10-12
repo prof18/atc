@@ -10,6 +10,7 @@ import {
 import { runCommandSync } from "./spawn.mjs";
 import {
   getAncestorPids,
+  recordHookSession,
   resolveStableParentPid,
   validateSessionId,
   withStateTransaction,
@@ -24,23 +25,37 @@ export function parseHookInput(rawStdin) {
   }
 }
 
+const ATC_MCP_TOOL_RE = /(?:^|[_:/.-])(atc_(?:claim|free|renew|snapshot|status|guide))$/i;
+const ATC_SESSION_MCP_TOOLS = new Set(["atc_claim", "atc_free", "atc_renew", "atc_snapshot"]);
+
+function matchAtcMcpTool(toolName) {
+  if (typeof toolName !== "string" || !toolName) return null;
+  const m = toolName.match(ATC_MCP_TOOL_RE);
+  return m ? m[1].toLowerCase() : null;
+}
+
 export function normalizeHookPayload(payload, ppid = process.ppid) {
   if (!payload || typeof payload !== "object") {
-    return { isShellTool: false };
+    return { isShellTool: false, mcpToolName: null };
   }
 
   // Antigravity / Gemini CLI format
   if (payload.toolCall && typeof payload.toolCall === "object") {
     const name = String(payload.toolCall.name || "");
-    const args = payload.toolCall.args || {};
+    const args =
+      payload.toolCall.args && typeof payload.toolCall.args === "object"
+        ? payload.toolCall.args
+        : {};
     const command = args.CommandLine ?? args.command ?? "";
     const rawSession = payload.conversationId || payload.session_id || `ppid-${ppid}`;
     return {
       hostFormat: "antigravity",
       isShellTool: name === "run_command" || name === "bash" || name === "shell",
+      mcpToolName: matchAtcMcpTool(name),
       command: typeof command === "string" ? command : "",
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
+      toolInput: args,
     };
   }
 
@@ -58,15 +73,40 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
     return {
       hostFormat: "cursor",
       isShellTool: true,
+      mcpToolName: null,
       command: typeof payload.command === "string" ? payload.command : "",
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
     };
   }
 
+  // GitHub Copilot CLI native format (camelCase `toolName` + `toolArgs`, object or JSON string)
+  if (typeof payload.toolName === "string" && "toolArgs" in payload && !payload.tool_input) {
+    let toolArgs = payload.toolArgs;
+    if (typeof toolArgs === "string") {
+      try {
+        toolArgs = JSON.parse(toolArgs);
+      } catch {
+        toolArgs = {};
+      }
+    }
+    if (!toolArgs || typeof toolArgs !== "object") toolArgs = {};
+    const rawSession = payload.sessionId || payload.session_id || `ppid-${ppid}`;
+    return {
+      hostFormat: "copilot",
+      isShellTool: /^(bash|shell)$/i.test(payload.toolName),
+      mcpToolName: matchAtcMcpTool(payload.toolName),
+      command: typeof toolArgs.command === "string" ? toolArgs.command : "",
+      sessionId: sanitizeSessionId(rawSession, ppid),
+      anchorPid: ppid,
+      toolInput: toolArgs,
+    };
+  }
+
   // Claude Code / Codex format
   const toolName = String(payload.tool_name || payload.toolName || "");
-  const toolInput = payload.tool_input || payload.input || {};
+  const rawInput = payload.tool_input || payload.input || {};
+  const toolInput = rawInput && typeof rawInput === "object" ? rawInput : {};
   const command = toolInput.command ?? toolInput.CommandLine ?? "";
   const rawSession =
     payload.session_id ||
@@ -77,6 +117,7 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
   return {
     hostFormat: "standard",
     isShellTool: /^(bash|shell|run_command|terminal)$/i.test(toolName),
+    mcpToolName: matchAtcMcpTool(toolName),
     command: typeof command === "string" ? command : "",
     sessionId: sanitizeSessionId(rawSession, ppid),
     anchorPid: ppid,
@@ -98,6 +139,59 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const fastNorm = normalizeHookPayload(payload, rawPpid);
   const cursorAllowOut =
     fastNorm.hostFormat === "cursor" ? JSON.stringify({ permission: "allow" }) + "\n" : "";
+
+  if (fastNorm.mcpToolName) {
+    getAncestorPids(rawPpid);
+    const norm = normalizeHookPayload(
+      payload,
+      resolveStableParentPid(rawPpid, options.processChain),
+    );
+    const cwd =
+      options.cwd ||
+      (typeof payload?.cwd === "string" && payload.cwd.trim() ? payload.cwd : process.cwd());
+    withStateTransaction(
+      stateDir,
+      (state, { now }) => {
+        recordHookSession(state, {
+          anchorPid: norm.anchorPid,
+          sessionId: norm.sessionId,
+          cwd,
+          now,
+          mcpToolName: norm.mcpToolName,
+          mcpToolInput: norm.toolInput,
+        });
+        return { mutated: true };
+      },
+      { ppid: norm.anchorPid },
+    );
+
+    if (
+      ATC_SESSION_MCP_TOOLS.has(norm.mcpToolName) &&
+      !norm.toolInput?.session &&
+      !norm.toolInput?.role
+    ) {
+      const updatedArgs = { ...norm.toolInput, session: norm.sessionId };
+      const allowMcpJson =
+        norm.hostFormat === "antigravity"
+          ? { overwrite: updatedArgs }
+          : norm.hostFormat === "copilot"
+            ? { permissionDecision: "allow", modifiedArgs: updatedArgs }
+            : {
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "allow",
+                  updatedInput: updatedArgs,
+                },
+              };
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(allowMcpJson) + "\n",
+        stderr: "",
+      };
+    }
+    return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
+  }
+
   if (!fastNorm.isShellTool || !fastNorm.command) {
     return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
   }
@@ -164,12 +258,14 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const evalResult = withStateTransaction(
     stateDir,
     (state, { now }) => {
-      state.hookSessions[String(norm.anchorPid)] = {
+      const hookEntry = recordHookSession(state, {
+        anchorPid: norm.anchorPid,
         sessionId: norm.sessionId,
-        agentPid: norm.anchorPid,
         cwd,
-        updatedAtMs: now,
-      };
+        now,
+      });
+      const singleSessionOnAnchor =
+        !Array.isArray(hookEntry.seenSessions) || hookEntry.seenSessions.length <= 1;
 
       const fallbackPpidSession = `ppid-${norm.anchorPid}`;
       const candidateFallbackSessions = new Set(
@@ -184,7 +280,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
           )
           .map((l) => l.sessionId),
       );
-      if (candidateFallbackSessions.size === 1) {
+      if (candidateFallbackSessions.size === 1 && singleSessionOnAnchor) {
         for (const l of Object.values(state.leases)) {
           if (l.state === "active" && candidateFallbackSessions.has(l.sessionId)) {
             if (String(l.sessionId).startsWith("mcp-")) {
@@ -275,15 +371,17 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
               user_message: evalResult.reason,
               agent_message: evalResult.reason,
             }
-          : {
-              decision: "block",
-              reason: evalResult.reason,
-              hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "deny",
-                permissionDecisionReason: evalResult.reason,
-              },
-            };
+          : norm.hostFormat === "copilot"
+            ? { permissionDecision: "deny", permissionDecisionReason: evalResult.reason }
+            : {
+                decision: "block",
+                reason: evalResult.reason,
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "deny",
+                  permissionDecisionReason: evalResult.reason,
+                },
+              };
     return {
       exitCode: 2,
       stdout: JSON.stringify(denyJson) + "\n",
@@ -299,16 +397,21 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
               CommandLine: evalResult.rewrittenCommand,
             },
           }
-        : {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
+        : norm.hostFormat === "copilot"
+          ? {
               permissionDecision: "allow",
-              updatedInput: {
-                ...norm.toolInput,
-                command: evalResult.rewrittenCommand,
+              modifiedArgs: { ...norm.toolInput, command: evalResult.rewrittenCommand },
+            }
+          : {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "allow",
+                updatedInput: {
+                  ...norm.toolInput,
+                  command: evalResult.rewrittenCommand,
+                },
               },
-            },
-          };
+            };
     return {
       exitCode: 0,
       stdout: JSON.stringify(allowJson) + "\n",
@@ -324,6 +427,12 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
   if (payload && payload.fullyIdle === false) {
     return { exitCode: 0, freed: [] };
   }
+  // GitHub Copilot fires sessionEnd with reason "complete" after every agent turn while the
+  // session stays open (same sessionId, same host process). Keep the lease; TTL expiry and
+  // dead-anchor GC reclaim it if the session never sends a terminal reason.
+  if (payload && payload.reason === "complete") {
+    return { exitCode: 0, freed: [] };
+  }
   const rawPpid = options.ppid ?? process.ppid;
   getAncestorPids(rawPpid);
   const ppid = resolveStableParentPid(rawPpid, options.processChain);
@@ -337,13 +446,34 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
   const targetSessionId = withStateTransaction(
     stateDir,
     (state) => {
+      const existingHook = state.hookSessions[String(ppid)];
+      const existingSeen = Array.isArray(existingHook?.seenSessions)
+        ? existingHook.seenSessions
+        : existingHook?.sessionId
+          ? [existingHook.sessionId]
+          : [];
       let resolvedId = rawSession ? sanitizeSessionId(rawSession, ppid) : null;
-      if (!resolvedId && state.hookSessions[String(ppid)]) {
-        resolvedId = state.hookSessions[String(ppid)].sessionId;
+      if (!resolvedId && existingHook && existingSeen.length <= 1) {
+        resolvedId = existingHook.sessionId;
       }
       const fallbackPpidSession = `ppid-${ppid}`;
-      let mutated = Boolean(state.hookSessions[String(ppid)]);
-      delete state.hookSessions[String(ppid)];
+      let mutated = Boolean(existingHook);
+      if (existingHook) {
+        const remainingSessions = resolvedId
+          ? existingSeen.filter((s) => s !== resolvedId)
+          : [];
+        if (remainingSessions.length > 0) {
+          existingHook.seenSessions = remainingSessions;
+          existingHook.sessionId = remainingSessions[remainingSessions.length - 1];
+          if (Array.isArray(existingHook.pendingMcpCalls)) {
+            existingHook.pendingMcpCalls = existingHook.pendingMcpCalls.filter(
+              (item) => item && item.sessionId !== resolvedId,
+            );
+          }
+        } else {
+          delete state.hookSessions[String(ppid)];
+        }
+      }
 
       const candidateFallbackSessions = new Set(
         Object.values(state.leases)
@@ -357,7 +487,7 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
           )
           .map((l) => l.sessionId),
       );
-      if (candidateFallbackSessions.size === 1) {
+      if (candidateFallbackSessions.size === 1 && existingSeen.length <= 1) {
         for (const l of Object.values(state.leases)) {
           if (l.state === "active" && candidateFallbackSessions.has(l.sessionId)) {
             if (resolvedId) {

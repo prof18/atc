@@ -2076,6 +2076,207 @@ export function validateSessionId(id) {
   return id;
 }
 
+export function canonicalizeMcpArgs(args) {
+  const sortJsonValue = (val) => {
+    if (Array.isArray(val)) return val.map(sortJsonValue);
+    if (val && typeof val === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(val).sort(([a], [b]) =>
+        a < b ? -1 : a > b ? 1 : 0,
+      )) {
+        if (v !== undefined) out[k] = sortJsonValue(v);
+      }
+      return out;
+    }
+    return val;
+  };
+  if (!args || typeof args !== "object" || Array.isArray(args)) return "{}";
+  const filtered = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (k !== "session" && k !== "role" && v !== undefined) {
+      filtered[k] = sortJsonValue(v);
+    }
+  }
+  return JSON.stringify(sortJsonValue(filtered));
+}
+
+export function recordHookSession(
+  state,
+  { anchorPid, sessionId, cwd, now = Date.now(), mcpToolName = null, mcpToolInput = null },
+) {
+  const pidKey = String(anchorPid);
+  const prev = state.hookSessions[pidKey];
+  const prevLive =
+    prev && typeof prev.updatedAtMs === "number" && now - prev.updatedAtMs <= 60_000;
+  const seenList =
+    prevLive && Array.isArray(prev.seenSessions)
+      ? prev.seenSessions.filter((s) => typeof s === "string" && s !== sessionId)
+      : prevLive && typeof prev.sessionId === "string" && prev.sessionId !== sessionId
+        ? [prev.sessionId]
+        : [];
+  seenList.push(sessionId);
+  const pendingMcpCalls = (
+    prevLive && Array.isArray(prev.pendingMcpCalls) ? prev.pendingMcpCalls : []
+  ).filter(
+    (item) => item && typeof item.updatedAtMs === "number" && now - item.updatedAtMs <= 60_000,
+  );
+  const hasExplicitMcpSessionArg = Boolean(
+    mcpToolInput &&
+      typeof mcpToolInput === "object" &&
+      ((typeof mcpToolInput.session === "string" && mcpToolInput.session.trim()) ||
+        (typeof mcpToolInput.role === "string" && mcpToolInput.role.trim())),
+  );
+  if (mcpToolName && !hasExplicitMcpSessionArg) {
+    pendingMcpCalls.push({
+      sessionId,
+      toolName: String(mcpToolName).toLowerCase(),
+      argsKey: canonicalizeMcpArgs(mcpToolInput),
+      updatedAtMs: now,
+    });
+  }
+  state.hookSessions[pidKey] = {
+    sessionId,
+    agentPid: anchorPid,
+    cwd,
+    updatedAtMs: now,
+    seenSessions: seenList,
+    pendingMcpCalls,
+  };
+  return state.hookSessions[pidKey];
+}
+
+export function consumePendingMcpHookSession(
+  stateDir,
+  {
+    toolName,
+    args = {},
+    ppid = process.ppid,
+    cwd = process.cwd(),
+    ancestorPids = null,
+    explicitSession = null,
+    ...txOptions
+  } = {},
+) {
+  try {
+    const peek = readState(stateDir);
+    if (!peek?.hookSessions || Object.keys(peek.hookSessions).length === 0) {
+      return { sessionId: explicitSession || null, error: null };
+    }
+  } catch {
+    // Fall through to transaction if state read fails
+  }
+  const normTool = String(toolName || "").toLowerCase();
+  const argsKey = canonicalizeMcpArgs(args);
+  if (!ancestorPids) {
+    getAncestorPids(ppid);
+  }
+  return withStateTransaction(
+    stateDir,
+    (state, { now }) => {
+      if (!state?.hookSessions) {
+        return { mutated: false, value: { sessionId: explicitSession || null, error: null } };
+      }
+      const ancestors = ancestorPids || ancestorPidCache.get(Number(ppid)) || [Number(ppid)];
+      let entry = state.hookSessions[String(ppid)] || null;
+      if (!entry) {
+        for (const ancPid of ancestors) {
+          if (state.hookSessions[String(ancPid)]) {
+            entry = state.hookSessions[String(ancPid)];
+            break;
+          }
+        }
+      }
+      if (!entry) {
+        const cwdMatches = Object.values(state.hookSessions).filter((h) => h && h.cwd === cwd);
+        if (cwdMatches.length === 1) {
+          entry = cwdMatches[0];
+        } else if (cwdMatches.length > 1) {
+          const ancestorSet = new Set(ancestors.map(Number));
+          const ancestorCwdMatches = cwdMatches.filter((h) =>
+            ancestorSet.has(Number(h.agentPid)),
+          );
+          if (ancestorCwdMatches.length === 1) {
+            entry = ancestorCwdMatches[0];
+          } else if (!explicitSession) {
+            return {
+              mutated: false,
+              value: {
+                sessionId: null,
+                error: `Multiple active agent sessions detected in ${cwd}; pass --session <unique_id> or ATC_SESSION_ID explicitly.`,
+              },
+            };
+          }
+        }
+      }
+      if (!entry) {
+        return { mutated: false, value: { sessionId: explicitSession || null, error: null } };
+      }
+
+      const livePending = Array.isArray(entry.pendingMcpCalls)
+        ? entry.pendingMcpCalls.filter(
+            (item) =>
+              item && typeof item.updatedAtMs === "number" && now - item.updatedAtMs <= 60_000,
+          )
+        : [];
+      let mutated =
+        Array.isArray(entry.pendingMcpCalls) && livePending.length !== entry.pendingMcpCalls.length;
+      entry.pendingMcpCalls = livePending;
+
+      if (explicitSession) {
+        const idx = livePending.findIndex(
+          (item) =>
+            item.sessionId === explicitSession &&
+            item.toolName === normTool &&
+            item.argsKey === argsKey,
+        );
+        if (idx !== -1) {
+          livePending.splice(idx, 1);
+          mutated = true;
+        }
+        return { mutated, value: { sessionId: explicitSession, error: null } };
+      }
+
+      const matching = livePending.filter(
+        (item) => item.toolName === normTool && item.argsKey === argsKey,
+      );
+      if (matching.length > 0) {
+        const matchingSessions = new Set(matching.map((m) => m.sessionId));
+        if (matchingSessions.size > 1) {
+          return {
+            mutated,
+            value: {
+              sessionId: null,
+              error: `Multiple concurrent agent sessions invoked ${normTool} with identical arguments without forwarding a session ID; pass session explicitly.`,
+            },
+          };
+        }
+        const resolved = matching[0].sessionId;
+        const idx = livePending.indexOf(matching[0]);
+        if (idx !== -1) {
+          livePending.splice(idx, 1);
+          mutated = true;
+        }
+        return { mutated, value: { sessionId: resolved, error: null } };
+      }
+
+      if (Array.isArray(entry.seenSessions) && entry.seenSessions.length > 1) {
+        return {
+          mutated,
+          value: {
+            sessionId: null,
+            error: `Multiple active agent sessions detected in ${cwd}; pass --session <unique_id> or ATC_SESSION_ID explicitly.`,
+          },
+        };
+      }
+      if (SESSION_ID_REGEX.test(entry.sessionId)) {
+        return { mutated, value: { sessionId: entry.sessionId, error: null } };
+      }
+      return { mutated, value: { sessionId: null, error: null } };
+    },
+    { ...txOptions, ppid },
+  );
+}
+
 export function resolveSessionIdentity({
   flags = {},
   env = process.env,
@@ -2094,7 +2295,11 @@ export function resolveSessionIdentity({
     if (explicitAnchor) return explicitAnchor;
     if (state?.hookSessions) {
       const matched = Object.values(state.hookSessions).find(
-        (h) => h && h.sessionId === sid && h.agentPid,
+        (h) =>
+          h &&
+          h.agentPid &&
+          (h.sessionId === sid ||
+            (Array.isArray(h.seenSessions) && h.seenSessions.includes(sid))),
       );
       if (matched) return Number(matched.agentPid);
     }
@@ -2103,14 +2308,81 @@ export function resolveSessionIdentity({
 
   const resolveMigratedMcpSession = (sid) => {
     if (sid.startsWith("mcp-") && state?.leases) {
-      const migrated = Object.values(state.leases).find(
-        (l) => l && l.state === "active" && l.mcpSessionId === sid,
+      const migratedSessions = new Set(
+        Object.values(state.leases)
+          .filter((l) => l && l.state === "active" && l.mcpSessionId === sid && l.sessionId)
+          .map((l) => l.sessionId),
       );
-      if (migrated && migrated.sessionId) {
-        return migrated.sessionId;
+      if (migratedSessions.size === 1) {
+        return [...migratedSessions][0];
       }
     }
     return sid;
+  };
+
+  const assertSingleHookSession = (entry) => {
+    if (Array.isArray(entry?.seenSessions) && entry.seenSessions.length > 1) {
+      const err = new Error(
+        `Multiple active agent sessions detected in ${cwd}; pass --session <unique_id> or ATC_SESSION_ID explicitly.`,
+      );
+      err.code = "EAMBIGUOUS_SESSION";
+      throw err;
+    }
+  };
+
+  const resolveFromHookSessions = () => {
+    if (!state?.hookSessions) return null;
+    const direct = state.hookSessions[String(ppid)];
+    if (direct && SESSION_ID_REGEX.test(direct.sessionId)) {
+      assertSingleHookSession(direct);
+      return {
+        sessionId: direct.sessionId,
+        anchorPid: Number(direct.agentPid || explicitAnchor || ppid),
+        source: "hook_ppid",
+      };
+    }
+    const ancestors = ancestorPids || ancestorPidCache.get(Number(ppid)) || [Number(ppid)];
+    for (const ancPid of ancestors) {
+      const ancMatch = state.hookSessions[String(ancPid)];
+      if (ancMatch && SESSION_ID_REGEX.test(ancMatch.sessionId)) {
+        assertSingleHookSession(ancMatch);
+        return {
+          sessionId: ancMatch.sessionId,
+          anchorPid: Number(ancMatch.agentPid || explicitAnchor || ancPid),
+          source: "hook_ancestor_pid",
+        };
+      }
+    }
+    const cwdMatches = Object.values(state.hookSessions).filter((h) => h && h.cwd === cwd);
+    if (cwdMatches.length === 1 && SESSION_ID_REGEX.test(cwdMatches[0].sessionId)) {
+      assertSingleHookSession(cwdMatches[0]);
+      return {
+        sessionId: cwdMatches[0].sessionId,
+        anchorPid: Number(cwdMatches[0].agentPid || explicitAnchor || stablePpid),
+        source: "hook_cwd",
+      };
+    }
+    if (cwdMatches.length > 1) {
+      const ancestorSet = new Set(ancestors.map(Number));
+      const ancestorCwdMatches = cwdMatches.filter((h) => ancestorSet.has(Number(h.agentPid)));
+      if (
+        ancestorCwdMatches.length === 1 &&
+        SESSION_ID_REGEX.test(ancestorCwdMatches[0].sessionId)
+      ) {
+        assertSingleHookSession(ancestorCwdMatches[0]);
+        return {
+          sessionId: ancestorCwdMatches[0].sessionId,
+          anchorPid: Number(ancestorCwdMatches[0].agentPid || explicitAnchor || stablePpid),
+          source: "hook_cwd_ancestor",
+        };
+      }
+      const err = new Error(
+        `Multiple active agent sessions detected in ${cwd}; pass --session <unique_id> or ATC_SESSION_ID explicitly.`,
+      );
+      err.code = "EAMBIGUOUS_SESSION";
+      throw err;
+    }
+    return null;
   };
 
   const explicitSessionFlag = flags.session || flags.role;
@@ -2152,6 +2424,8 @@ export function resolveSessionIdentity({
     "ANTIGRAVITY_CONVERSATION_ID",
     "GEMINI_SESSION_ID",
     "CLAUDE_SESSION_ID",
+    "COPILOT_SESSION_ID",
+    "GITHUB_COPILOT_SESSION_ID",
     "CONVERSATION_ID",
   ];
   for (const key of hostEnvKeys) {
@@ -2165,53 +2439,18 @@ export function resolveSessionIdentity({
     }
   }
 
-  if (state?.hookSessions) {
-    const direct = state.hookSessions[String(ppid)];
-    if (direct && SESSION_ID_REGEX.test(direct.sessionId)) {
-      return {
-        sessionId: direct.sessionId,
-        anchorPid: Number(direct.agentPid || ppid),
-        source: "hook_ppid",
-      };
-    }
-    const ancestors = ancestorPids || ancestorPidCache.get(Number(ppid)) || [Number(ppid)];
-    for (const ancPid of ancestors) {
-      const ancMatch = state.hookSessions[String(ancPid)];
-      if (ancMatch && SESSION_ID_REGEX.test(ancMatch.sessionId)) {
-        return {
-          sessionId: ancMatch.sessionId,
-          anchorPid: Number(ancMatch.agentPid || ancPid),
-          source: "hook_ancestor_pid",
-        };
-      }
-    }
-    const cwdMatches = Object.values(state.hookSessions).filter((h) => h && h.cwd === cwd);
-    if (cwdMatches.length === 1 && SESSION_ID_REGEX.test(cwdMatches[0].sessionId)) {
-      return {
-        sessionId: cwdMatches[0].sessionId,
-        anchorPid: Number(cwdMatches[0].agentPid || stablePpid),
-        source: "hook_cwd",
-      };
-    }
-    if (cwdMatches.length > 1) {
-      const ancestorSet = new Set(ancestors.map(Number));
-      const ancestorCwdMatches = cwdMatches.filter((h) => ancestorSet.has(Number(h.agentPid)));
-      if (
-        ancestorCwdMatches.length === 1 &&
-        SESSION_ID_REGEX.test(ancestorCwdMatches[0].sessionId)
-      ) {
-        return {
-          sessionId: ancestorCwdMatches[0].sessionId,
-          anchorPid: Number(ancestorCwdMatches[0].agentPid || stablePpid),
-          source: "hook_cwd_ancestor",
-        };
-      }
-      const err = new Error(
-        `Multiple active agent sessions detected in ${cwd}; pass --session <unique_id> or ATC_SESSION_ID explicitly.`,
-      );
-      err.code = "EAMBIGUOUS_SESSION";
-      throw err;
-    }
+  const hookResolved = resolveFromHookSessions();
+  if (hookResolved) {
+    return hookResolved;
+  }
+
+  if (env.ATC_MCP_DEFAULT_SESSION_ID) {
+    const sid = resolveMigratedMcpSession(validateSessionId(env.ATC_MCP_DEFAULT_SESSION_ID));
+    return {
+      sessionId: sid,
+      anchorPid: findHookAnchorForSession(sid),
+      source: "env_atc",
+    };
   }
 
   const termKey = env.TMUX_PANE || env.TERM_SESSION_ID;

@@ -44,6 +44,23 @@ codex plugin marketplace add rock3r/atc
 codex plugin add atc@atc
 ```
 
+### GitHub Copilot CLI & Copilot app
+
+Add the marketplace and install the `atc` plugin (the root `plugin.json` is an Agent Plugins 1.0 manifest; Copilot loads the skill from `skills/atc/`, the `preToolUse` / `sessionEnd` hooks from `com.github.copilot/hooks/hooks.json`, and the `atc mcp` server from `mcp.json`):
+
+```bash
+copilot plugin marketplace add rock3r/atc
+copilot plugin install atc@atc
+```
+
+To test a local checkout, pass its path to `copilot plugin marketplace add` instead. Run `copilot plugin marketplace update` and reinstall after updating, because Copilot caches plugin components. The hooks locate the globally installed `atc` CLI, so step 1 is required.
+
+Copilot fires `sessionEnd` with `reason: "complete"` after every agent turn, so `atc` keeps the lease on that reason and releases it only on a terminal reason (`user_exit`, `abort`, `error`, `timeout`). Archiving a Copilot app session sends no hook event; its lease is reclaimed by TTL expiry (`defaultTtlSec`, 600 s by default), or run `atc free` before closing. Quitting the Copilot app releases its leases on the next `atc` invocation (dead-anchor GC). Long-running `atc exec` commands are never cut off by the TTL, because the worker heartbeat keeps the lease alive.
+
+### VS Code (GitHub Copilot agent mode)
+
+Experimental: VS Code hooks are in Preview. VS Code can load Claude-format plugins (`.claude-plugin/plugin.json` + `hooks/hooks.json`), or you can enable `chat.useClaudeHooks` and wire `atc hook pre-tool-use` / `atc hook stop` in `.claude/settings.json`.
+
 ### Gemini CLI & Antigravity
 
 Copy or symlink `skills/atc` into your skills directory (`~/.gemini/skills/atc` or `~/.agents/skills/atc`), and wire `atc hook pre-tool-use` / `atc hook stop` in your hook configuration.

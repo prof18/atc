@@ -55,6 +55,8 @@
     ".cursor/",
     ".claude-plugin/",
     ".mcp.json",
+    "mcp.json",
+    "com.github.copilot/",
     "hooks.json",
     "plugin.json",
     "privacy.md",

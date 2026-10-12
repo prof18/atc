@@ -440,6 +440,257 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
   );
 });
 
+test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
+  const dir = makeTempStateDir();
+  try {
+    // Non-shell tools and non-device shell commands pass through silently
+    const viewAllow = handlePreToolUseHook(
+      dir,
+      JSON.stringify({ sessionId: "cp-1", toolName: "view", toolArgs: { path: "README.md" } }),
+      { ppid: process.pid }
+    );
+    assert.equal(viewAllow.exitCode, 0);
+    assert.equal(viewAllow.stdout, "");
+
+    // Unleased adb is denied with Copilot's permissionDecision shape (toolArgs as JSON string)
+    const deny = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        cwd: process.cwd(),
+        toolName: "bash",
+        toolArgs: JSON.stringify({ command: "adb shell pm list packages" }),
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(deny.exitCode, 2);
+    const denyOut = JSON.parse(deny.stdout);
+    assert.equal(denyOut.permissionDecision, "deny");
+    assert.match(denyOut.permissionDecisionReason, /atc/);
+    assert.equal(denyOut.hookSpecificOutput, undefined);
+
+    // `atc claim` is rewritten via modifiedArgs, preserving other tool args (toolArgs as object)
+    const rewrite = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        toolName: "bash",
+        toolArgs: { command: "atc claim --type phone", description: "claim" },
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(rewrite.exitCode, 0);
+    const rewriteOut = JSON.parse(rewrite.stdout);
+    assert.equal(rewriteOut.permissionDecision, "allow");
+    assert.equal(rewriteOut.modifiedArgs.description, "claim");
+    assert.match(rewriteOut.modifiedArgs.command, /(?:ATC_SESSION_ID=cp-1|--session cp-1)/);
+
+    // Concurrent Copilot chats sharing a single long-lived MCP process get isolated session IDs
+    const mcpInventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      running: [
+        {
+          deviceKey: "avd:Pixel_8_API_35",
+          avd: "Pixel_8_API_35",
+          serial: "emulator-5554",
+          kind: "emulator",
+          online: true,
+          profile: { deviceType: "phone", apiLevel: "android-35" },
+        },
+      ],
+      offline: [],
+      creatable: [],
+    };
+    const sharedMcpOpts = { ppid: process.pid, pid: process.pid, env: {}, inventory: mcpInventory };
+    const preMcpClaim = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        cwd: process.cwd(),
+        toolName: "atc-atc_claim",
+        toolArgs: JSON.stringify({ avd: "Pixel_8_API_35" }),
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(preMcpClaim.exitCode, 0);
+    const preMcpClaimOut = JSON.parse(preMcpClaim.stdout);
+    assert.equal(preMcpClaimOut.permissionDecision, "allow");
+    assert.equal(preMcpClaimOut.modifiedArgs.avd, "Pixel_8_API_35");
+    assert.equal(preMcpClaimOut.modifiedArgs.session, "cp-1");
+
+    // Overlapping preToolUse from cp-2 before cp-1's MCP request arrives does not overwrite cp-1's invocation
+    const preMcpFreeOther = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-2",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: {},
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(preMcpFreeOther.exitCode, 0);
+    assert.equal(JSON.parse(preMcpFreeOther.stdout).modifiedArgs.session, "cp-2");
+
+    // Even if the host does not forward modifiedArgs into the MCP call, pendingMcpCalls resolves cp-1 for atc_claim
+    const mcpClaimReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "atc_claim", arguments: { avd: "Pixel_8_API_35" } },
+      },
+      sharedMcpOpts
+    );
+    assert.equal(JSON.parse(mcpClaimReply.result.content[0].text).exitCode, 0);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].sessionId, "cp-1");
+
+    // And cp-2's pending atc_free resolves cp-2, which cannot free cp-1's lease
+    const mcpFreeOtherReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "atc_free", arguments: {} },
+      },
+      sharedMcpOpts
+    );
+    assert.deepEqual(JSON.parse(mcpFreeOtherReply.result.content[0].text).freed, []);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].sessionId, "cp-1");
+
+    // An explicit session override in MCP toolArgs neither records a stale pending entry nor consumes another chat's pending unforwarded call
+    handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-2",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: {},
+      }),
+      { ppid: process.pid }
+    );
+    handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: { session: "manual" },
+      }),
+      { ppid: process.pid }
+    );
+    const explicitOverrideReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: { name: "atc_free", arguments: { session: "manual" } },
+      },
+      sharedMcpOpts
+    );
+    assert.equal(explicitOverrideReply.result.isError, false);
+    const postOverrideUnforwardedReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 22,
+        method: "tools/call",
+        params: { name: "atc_free", arguments: {} },
+      },
+      sharedMcpOpts
+    );
+    assert.equal(postOverrideUnforwardedReply.result.isError, false);
+    assert.deepEqual(JSON.parse(postOverrideUnforwardedReply.result.content[0].text).freed, []);
+
+    // Overlapping identical unforwarded MCP calls from cp-1 and cp-2 fail closed as ambiguous
+    handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: {},
+      }),
+      { ppid: process.pid }
+    );
+    handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-2",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: {},
+      }),
+      { ppid: process.pid }
+    );
+    const ambiguousReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "atc_free", arguments: {} },
+      },
+      sharedMcpOpts
+    );
+    assert.equal(ambiguousReply.result.isError, true);
+    const ambiguousPayload = JSON.parse(ambiguousReply.result.content[0].text);
+    assert.equal(ambiguousPayload.code, "AmbiguousSessionError");
+    assert.match(ambiguousPayload.error, /Multiple concurrent agent sessions/);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].sessionId, "cp-1");
+
+    // Explicit ATC_SESSION_ID values starting with "mcp-" are still honored over hookSessions
+    const explicitMcpEnvIdentity = resolveSessionIdentity({
+      state: readState(dir),
+      env: { ATC_SESSION_ID: "mcp-build" },
+      ppid: process.pid,
+      cwd: process.cwd(),
+    });
+    assert.equal(explicitMcpEnvIdentity.sessionId, "mcp-build");
+    assert.equal(explicitMcpEnvIdentity.source, "env_atc");
+
+    // sessionEnd with reason "complete" fires after every Copilot turn: keep the lease.
+    // A terminal reason (user_exit/abort/error/timeout) releases it.
+    const stopOpts = {
+      ppid: process.pid,
+      host: { freeDiskMb: 65536 },
+      runner: () => ({ status: 0, stdout: "OK", stderr: "" }),
+    };
+    const turnEnd = handleStopHook(
+      dir,
+      JSON.stringify({ sessionId: "cp-1", cwd: process.cwd(), reason: "complete" }),
+      stopOpts
+    );
+    assert.deepEqual(turnEnd.freed, []);
+    const userExit = handleStopHook(
+      dir,
+      JSON.stringify({ sessionId: "cp-1", cwd: process.cwd(), reason: "user_exit" }),
+      stopOpts
+    );
+    assert.equal(userExit.exitCode, 0);
+    assert.equal(userExit.freed.length, 1);
+
+    // Copilot hook manifest exists where Agent Plugins 1.0 loads it, and MCP config at root mcp.json
+    const rootDir = new URL("../", import.meta.url);
+    const copilotHooks = JSON.parse(
+      fs.readFileSync(new URL("com.github.copilot/hooks/hooks.json", rootDir), "utf8")
+    );
+    assert.equal(copilotHooks.version, 1);
+    assert.match(copilotHooks.hooks.preToolUse[0].command, /'hook', 'PreToolUse'/);
+    assert.match(copilotHooks.hooks.sessionEnd[0].command, /'hook', 'SessionEnd'/);
+    // Agent Plugins 1.0 skips a root mcp.json without the matching $schema; stdio needs explicit type
+    const mcp = JSON.parse(fs.readFileSync(new URL("mcp.json", rootDir), "utf8"));
+    assert.equal(mcp.$schema, "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json");
+    assert.equal(mcp.mcpServers.atc.type, "stdio");
+    assert.equal(mcp.mcpServers.atc.command, "atc");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
   const dir = makeTempStateDir();
   try {
