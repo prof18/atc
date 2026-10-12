@@ -6,10 +6,10 @@ const GUARDED_TOOL_NAMES_RE_SRC =
   "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild)";
 const TOOL_NAMES_RE_SRC =
   "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
-const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%-]+(?:\\.[A-Za-z0-9_+~%-]+)*";
+const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%@-]+(?:\\.[A-Za-z0-9_+~%@-]+)*";
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`(?<=.)\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
 const TOOL_WRAPPER_AFFIX_RE = new RegExp(
-  `^(?:[A-Za-z0-9._+~%-]*[-_.])?(${GUARDED_TOOL_NAMES_RE_SRC})(?:[._+~%-][A-Za-z0-9._+~%-]*)?$`,
+  `^(?:[A-Za-z0-9._+~%@-]*[-_.@])?(${GUARDED_TOOL_NAMES_RE_SRC})(?:[._+~%@-][A-Za-z0-9._+~%@-]*)?$`,
   "i",
 );
 const NPM_VERSION_TAG_RE_SRC =
@@ -20,7 +20,7 @@ const NPM_VERSION_TAG_STRIP_RE = new RegExp(`@${NPM_VERSION_TAG_RE_SRC}$`, "i");
 // `npx @rock3r/atc@2`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a directory segment or fragment
 // of a longer word/identifier (`my-android-app/`, `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
 const STANDALONE_TOOL_REGEX = new RegExp(
-  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_+~%-])|@${NPM_VERSION_TAG_RE_SRC}(?![A-Za-z0-9_.-]))?(?![A-Za-z0-9_.@/\\\\~%-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
+  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_+~%@-])|@${NPM_VERSION_TAG_RE_SRC}(?![A-Za-z0-9_.-]))?(?![A-Za-z0-9_.@/\\\\~%-])|(?<=[/\\\\])(?:[A-Za-z0-9._+~%@-]*@)?${GUARDED_TOOL_NAMES_RE_SRC}(?:@[A-Za-z0-9._+~%@-]+)?(?![A-Za-z0-9_.@/\\\\~%-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
   "i",
 );
 const NODE_VALUE_FLAGS = new Set([
@@ -352,13 +352,20 @@ function extractExecutableBase(
   const cleaned = tok.replace(/^@+/, "");
   let file = cleaned.split(/[\\/]/).pop() || "";
   if (!file || /[\s"'`();|&[\]{},<>]/.test(file)) return "";
+  const rawLowerFile = file.toLowerCase();
+  if (/(?:\.test|\.spec)\.[A-Za-z0-9_+~%@-]+$/i.test(rawLowerFile)) {
+    return rawLowerFile;
+  }
+  if (allowWrapperAffix && !/^emulator-\d+$/i.test(rawLowerFile)) {
+    const rawAffixMatch = rawLowerFile.match(TOOL_WRAPPER_AFFIX_RE);
+    if (rawAffixMatch) {
+      return rawAffixMatch[1].toLowerCase();
+    }
+  }
   if (allowPackageSpec || isScopedPkg) {
     file = file.replace(/@[A-Za-z0-9._~^>=<+-]+$/, "");
   }
   const lowerFile = file.toLowerCase();
-  if (/(?:\.test|\.spec)\.[A-Za-z0-9_+~%-]+$/i.test(lowerFile)) {
-    return lowerFile;
-  }
   if (allowWrapperAffix && !/^emulator-\d+$/i.test(lowerFile)) {
     const fileAffixMatch = lowerFile.match(TOOL_WRAPPER_AFFIX_RE);
     if (fileAffixMatch) {
@@ -2828,6 +2835,7 @@ export function classifySegment(
     let isNodeNonExecMode = false;
     let nodeScriptRelIdx = -1;
     let canPeelNodeScript = false;
+    let hasNodeEvalFlag = false;
     if (isNodeCmd) {
       let sawNodeTest = false;
       let sawNodeCheck = false;
@@ -2917,6 +2925,7 @@ export function classifySegment(
       ) {
         isNodeNonExecMode = true;
       }
+      hasNodeEvalFlag = hasEvalFlag;
       canPeelNodeScript =
         !hasEvalFlag &&
         !hasPreloadFlag &&
@@ -2970,18 +2979,25 @@ export function classifySegment(
         : searchArgs.findIndex((a, i) => {
             if (!a) return false;
             if (nodeOptValueIndices.has(i)) {
-              return false;
+              const optValBase = extractExecutableBase(a, { allowWrapperAffix: true });
+              if (!hasNodeEvalFlag && nodeScriptRelIdx !== -1 && optValBase === "atc") {
+                return false;
+              }
             }
             if (isNodeCmd) {
               if (nodeScriptRelIdx !== -1 && i > nodeScriptRelIdx) {
                 return false;
               }
-              if (/(?:\.test|\.spec)\.[A-Za-z0-9_+~%-]+$/i.test(a)) {
+              if (/(?:\.test|\.spec)\.[A-Za-z0-9_+~%@-]+$/i.test(a)) {
                 return false;
               }
             }
             const b = extractExecutableBase(a, {
-              allowWrapperAffix: i === firstExecRelIdx,
+              allowWrapperAffix:
+                i === firstExecRelIdx ||
+                nodeOptValueIndices.has(i) ||
+                (/^\.{1,2}[\\/]/.test(a) &&
+                  !/\.(?:json|html?|md|txt|xml|ya?ml|csv|log|lock|css|svg|png)$/i.test(a)),
             });
             return (
               [
@@ -3026,7 +3042,9 @@ export function classifySegment(
         ? sedOrAwkScripts
         : [
             ...args.slice(startSearchIdx),
-            ...(isNodeCmd && parsed.envVars?.NODE_OPTIONS ? [parsed.envVars.NODE_OPTIONS] : []),
+            ...(isNodeCmd && parsed.envVars?.NODE_OPTIONS
+              ? [parsed.envVars.NODE_OPTIONS, ...tokenizeSegment(parsed.envVars.NODE_OPTIONS)]
+              : []),
           ];
     const embeddedCandidates = extractEmbeddedCommands(candidateSourceArgs);
     if (embeddedCandidates.length > 0) {
@@ -3190,8 +3208,33 @@ function extractSedOrAwkScripts(baseCmd, args) {
 function extractEmbeddedCommands(args) {
   const candidates = [];
   const toolNames = new Set(TOOL_NAMES);
+  const argToolTokens = new Set();
+  for (let i = 0; i < args.length; i++) {
+    const rawArg = String(args[i] ?? "");
+    if (!rawArg || /\.(?:json|html?|md|txt|xml|ya?ml|csv|log|lock|css|svg|png)$/i.test(rawArg)) {
+      continue;
+    }
+    const isTitleVal = i > 0 && args[i - 1] === "--title";
+    const directBase = extractExecutableBase(rawArg, {
+      allowWrapperAffix: isTitleVal || /^\.{1,2}[\\/]/.test(rawArg),
+    });
+    if (toolNames.has(directBase)) {
+      argToolTokens.add(directBase);
+    }
+    if (rawArg.startsWith("-") && rawArg.includes("=")) {
+      const eqVal = rawArg.slice(rawArg.indexOf("=") + 1);
+      const eqBase = extractExecutableBase(eqVal, {
+        allowWrapperAffix: /^--title=/i.test(rawArg) || /^\.{1,2}[\\/]/.test(eqVal),
+      });
+      if (toolNames.has(eqBase)) {
+        argToolTokens.add(eqBase);
+      }
+    }
+  }
+  const nonModuleLiteralRe =
+    /^(?:node:)?(?:child_process|fs|path|os|util|url|http|https|net|stream|events|crypto|buffer|process|assert|v8|vm|worker_threads|cluster|zlib|readline|tty|tls|dns|dgram|perf_hooks|async_hooks|inspector|module|timers|string_decoder|querystring|punycode|constants|domain|sys)(?:\/.*)?$/i;
   for (const rawArg of args) {
-    if (!rawArg || !matchesAndroidOrAtcText(rawArg)) continue;
+    if (!rawArg || (!matchesAndroidOrAtcText(rawArg) && argToolTokens.size === 0)) continue;
     const arg = String(rawArg).replace(/\\(["'`\\])/g, "$1");
     const literals = [];
     const litRe = /"([^"]*)"|'([^']*)'|`([^`]*)`/g;
@@ -3241,12 +3284,33 @@ function extractEmbeddedCommands(args) {
           hasExecCallContext || /^(?:\.{1,2}[\\/]|\/|[A-Za-z]:[\\/])/.test(literals[i]),
       });
       if (toolNames.has(base)) {
+        argToolTokens.add(base);
         const joined = literals
           .slice(i)
           .map((l) => (/[\s"'\\]/.test(l) ? JSON.stringify(l) : l))
           .join(" ");
         if (joined) candidates.push(joined);
         break;
+      }
+    }
+    if (argToolTokens.size > 0 && literals.length > 0) {
+      const nonModLiterals = literals
+        .map((l) => l.trim())
+        .filter((l) => l && !nonModuleLiteralRe.test(l));
+      for (const toolTok of argToolTokens) {
+        for (const lit of nonModLiterals) {
+          if (extractExecutableBase(lit) !== toolTok) {
+            candidates.push(`${toolTok} ${lit}`);
+          }
+        }
+        if (nonModLiterals.length > 1) {
+          const tail = nonModLiterals
+            .filter((l) => extractExecutableBase(l) !== toolTok)
+            .join(" ");
+          if (tail) {
+            candidates.push(`${toolTok} ${tail}`);
+          }
+        }
       }
     }
     const inlineRe =

@@ -801,6 +801,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "pnpm -C adb@2 exec adb kill-server",
     "sh <<'EOF'\na\\\ndb kill-server\nEOF",
     `node -e 'require("child_process").spawnSync(process.argv[2],process.argv.slice(3))' -- --title adb kill-server`,
+    `node --title adb -e 'require("node:child_process").execSync(process.title+" kill-server")'`,
+    `node --title=adb -e 'require("node:child_process").execSync(process.title+" kill-server")'`,
     "cat <<$'EOF'\nbody\nEOF\nadb kill-server",
     'cat <<$"EOF"\nbody\nEOF\nadb kill-server',
     "cat <<EOF\n$\\\n(adb kill-server)\nEOF",
@@ -808,6 +810,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "./adb_wrapper kill-server",
     "./my-adb kill-server",
     "./wrapper.adb kill-server",
+    "./adb@wrapper kill-server",
+    "./wrapper@adb kill-server",
     "python3 scripts/adb-wrapper.py kill-server",
     "cat <<EOF > >(sh)\nadb kill-server\nEOF",
     "cat <<'EOF' > >(sh)\na\\\ndb kill-server\nEOF",
@@ -821,6 +825,9 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "./adb-wrapper shell getprop",
     "./adb_wrapper shell getprop",
     "./wrapper.adb shell getprop",
+    "./adb@wrapper shell getprop",
+    "./wrapper@adb shell getprop",
+    `node --title adb -e 'require("node:child_process").execSync(process.title+" shell getprop")'`,
     "python3 scripts/adb-wrapper.py shell getprop",
     "cat <<EOF > >(sh)\nadb shell getprop\nEOF",
   ]) {
@@ -858,6 +865,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   assert.equal(
     dotWrapperLeasedRes.rewrittenCommand,
     "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./wrapper.adb shell getprop",
+  );
+  const atWrapperLeasedRes = evaluateCommandGuard("./adb@wrapper shell getprop", {
+    ...leasedOpts,
+    platform: "linux",
+  });
+  assert.equal(atWrapperLeasedRes.allowed, true);
+  assert.equal(
+    atWrapperLeasedRes.rewrittenCommand,
+    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./adb@wrapper shell getprop",
   );
   const heredocSubRes = evaluateCommandGuard(
     "cat <<EOF\n$(adb shell getprop ro.build.version.release)\nEOF",
