@@ -2,10 +2,10 @@ import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
 // Stricter than FAST_PATH_REGEX: the tool name must be a standalone shell word or an executable path
-// (`adb`, `/usr/bin/adb`, `"adb shell"`, `adb.exe`), not a fragment of a longer word such as
-// `my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, or `atc@atc`.
+// (`adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `"adb shell"`, `adb</dev/null`), not a fragment of a longer
+// word such as `my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, or `atc@atc`.
 const STANDALONE_TOOL_REGEX =
-  /(?:^|[\s"'`(;|&=/[{,])(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd))?(?=$|[\s"'`);|&\]},])/i;
+  /(?:^|[\s"'`(;|&=/\\[{,<>])(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?:\.(?:exe|bat|cmd))?(?=$|[\s"'`);|&\]}<>,])/i;
 const TRANSPARENT_WRAPPERS = new Set([
   "env",
   "command",
@@ -296,6 +296,8 @@ function matchesAndroidOrAtcText(str, inheritedVars = {}, toolRegex = FAST_PATH_
   );
   if (toolRegex.test(ansiDecoded)) return true;
   const normalizedVars = ansiDecoded.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+  const unquoted = normalizedVars.replace(/\\["']/g, "").replace(/["']/g, "");
+  if (toolRegex.test(unquoted)) return true;
   const collapsed = decodeShellEscapes(normalizedVars)
     .replace(/\\(.)/g, "$1")
     .replace(/["']/g, "");

@@ -717,6 +717,10 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     `perl -e 'system("adb.exe shell input tap 1 1")'`,
     "node -e 'spawn(...[adb,shell,input])'",
     "ruby -e 'system(%w{adb shell input tap 1 1})'",
+    `python3 -c "import subprocess; subprocess.run([r'C:\\sdk\\platform-tools\\adb.exe','shell','input','keyevent','82'])"`,
+    `node -e 'require("child_process").execSync("C:\\\\sdk\\\\platform-tools\\\\a\\"\\"db.exe shell pm clear com.x")'`,
+    `node -e 'require("child_process").execSync("adb</dev/null shell input keyevent 82")'`,
+    `node -e 'require("child_process").execSync("adb>/dev/null shell input keyevent 82")'`,
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
