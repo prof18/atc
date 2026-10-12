@@ -703,6 +703,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "python3 render.py --root /work/my-android-app",
     "bin/search --scope project:my-android-app notes",
     "node scripts/build.mjs --out dist/gradle-report.html",
+    "node script.mjs 'a\\\ndb shell'",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, true, cmd);
   }
@@ -739,6 +740,9 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "@adb shell pm clear com.x",
     "npx adb@1.0.0 shell pm clear com.x",
     "npm exec -- @scope/adb@2 shell pm clear com.x",
+    "npm exec -c 'adb shell getprop'",
+    "npx --call='adb shell getprop'",
+    "npm exec --package adb@2 -- adb shell getprop",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
@@ -757,6 +761,10 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     'cmd.exe /c "@adb kill-server"',
     "npx adb@1.0.0 kill-server",
     "npx @scope/adb@2 kill-server",
+    "npm exec -c 'adb kill-server'",
+    "npx --call='adb kill-server'",
+    "npm exec --package adb@2 -- adb kill-server",
+    "npx -p adb@2 -- adb kill-server",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
   }
@@ -781,6 +789,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   });
   assert.equal(atcNpxWinRes.allowed, true);
   assert.equal(atcNpxWinRes.rewrittenCommand, "npx @rock3r/atc@2 free --session sess-unleased");
+  const atcNpmPkgWinRes = evaluateCommandGuard("npm exec --package @rock3r/atc@2 -- atc free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcNpmPkgWinRes.allowed, true);
+  assert.equal(
+    atcNpmPkgWinRes.rewrittenCommand,
+    "npm exec --package @rock3r/atc@2 -- atc free --session sess-unleased",
+  );
   const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
   assert.equal(atcWinRes.allowed, true);
   assert.match(atcWinRes.rewrittenCommand || "", /--session sess-unleased/);

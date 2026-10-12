@@ -414,7 +414,7 @@ function stripLineContinuations(str) {
 
 function matchesAndroidOrAtcText(rawStr, inheritedVars = {}, toolRegex = FAST_PATH_REGEX) {
   if (!rawStr || typeof rawStr !== "string") return false;
-  const str = rawStr.replace(/\\\r?\n/g, "");
+  const str = stripLineContinuations(rawStr);
   if (toolRegex.test(str)) return true;
   const subExpanded =
     str.includes("$") || str.includes("`") ? extractCommandSubstitutions(str, []) : str;
@@ -1373,20 +1373,32 @@ export function parseSegment(segment, inheritedVars = {}) {
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx++];
           if (flag === "--") break;
-          if (
-            (flag === "-c" || flag === "--call" || flag === "--shell" || flag === "--prefix") &&
-            idx < tokens.length
-          ) {
+          if (flag === "-c" || flag === "--call") {
+            const callStr = tokens[idx] || "";
+            if (idx < tokens.length) {
+              tokens.splice(idx, 1, "sh", "-c", callStr);
+            }
+            break;
+          }
+          if (flag.startsWith("--call=") || (flag.startsWith("-c=") && flag.length > 3)) {
+            const callStr = flag.slice(flag.indexOf("=") + 1);
+            tokens.splice(idx, 0, "sh", "-c", callStr);
+            break;
+          }
+          if ((flag === "--shell" || flag === "--prefix") && idx < tokens.length) {
             idx++;
           } else if (
             (flag === "-p" || flag === "--package") &&
-            idx + 1 < tokens.length &&
-            (TOOL_NAMES.includes(
-              extractExecutableBase(tokens[idx + 1], { allowPackageSpec: true }),
-            ) ||
-              !TOOL_NAMES.includes(extractExecutableBase(tokens[idx], { allowPackageSpec: true })))
+            idx < tokens.length &&
+            tokens.slice(idx + 1).some((t) => t !== "--")
           ) {
             idx++;
+          } else if (
+            (flag.startsWith("--package=") || (flag.startsWith("-p=") && flag.length > 3)) &&
+            !tokens.slice(idx).some((t) => t !== "--")
+          ) {
+            tokens.splice(idx, 0, flag.slice(flag.indexOf("=") + 1));
+            break;
           }
         }
       }
@@ -1402,24 +1414,38 @@ export function parseSegment(segment, inheritedVars = {}) {
       while (idx < tokens.length && tokens[idx].startsWith("-")) {
         const flag = tokens[idx++];
         if (flag === "--") break;
+        if (flag === "-c" || flag === "--call") {
+          const callStr = tokens[idx] || "";
+          if (idx < tokens.length) {
+            tokens.splice(idx, 1, "sh", "-c", callStr);
+          }
+          break;
+        }
+        if (flag.startsWith("--call=") || (flag.startsWith("-c=") && flag.length > 3)) {
+          const callStr = flag.slice(flag.indexOf("=") + 1);
+          tokens.splice(idx, 0, "sh", "-c", callStr);
+          break;
+        }
         if (
-          (flag === "-c" ||
-            flag === "--call" ||
-            flag === "-w" ||
+          (flag === "-w" ||
             flag === "--workspace" ||
-            flag === "--prefix") &&
+            flag === "--prefix" ||
+            flag === "--shell") &&
           idx < tokens.length
         ) {
           idx++;
         } else if (
           (flag === "-p" || flag === "--package") &&
-          idx + 1 < tokens.length &&
-          (TOOL_NAMES.includes(
-            extractExecutableBase(tokens[idx + 1], { allowPackageSpec: true }),
-          ) ||
-            !TOOL_NAMES.includes(extractExecutableBase(tokens[idx], { allowPackageSpec: true })))
+          idx < tokens.length &&
+          tokens.slice(idx + 1).some((t) => t !== "--")
         ) {
           idx++;
+        } else if (
+          (flag.startsWith("--package=") || (flag.startsWith("-p=") && flag.length > 3)) &&
+          !tokens.slice(idx).some((t) => t !== "--")
+        ) {
+          tokens.splice(idx, 0, flag.slice(flag.indexOf("=") + 1));
+          break;
         }
       }
       continue;
