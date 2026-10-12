@@ -485,29 +485,81 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
     assert.equal(rewriteOut.modifiedArgs.description, "claim");
     assert.match(rewriteOut.modifiedArgs.command, /(?:ATC_SESSION_ID=cp-1|--session cp-1)/);
 
+    // Concurrent Copilot chats sharing a single long-lived MCP process get isolated session IDs
+    const mcpInventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      running: [
+        {
+          deviceKey: "avd:Pixel_8_API_35",
+          avd: "Pixel_8_API_35",
+          serial: "emulator-5554",
+          kind: "emulator",
+          online: true,
+          profile: { deviceType: "phone", apiLevel: "android-35" },
+        },
+      ],
+      offline: [],
+      creatable: [],
+    };
+    const sharedMcpOpts = { ppid: process.pid, pid: process.pid, env: {}, inventory: mcpInventory };
+    const preMcpClaim = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-1",
+        cwd: process.cwd(),
+        toolName: "atc-atc_claim",
+        toolArgs: JSON.stringify({ avd: "Pixel_8_API_35" }),
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(preMcpClaim.exitCode, 0);
+    const preMcpClaimOut = JSON.parse(preMcpClaim.stdout);
+    assert.equal(preMcpClaimOut.permissionDecision, "allow");
+    assert.equal(preMcpClaimOut.modifiedArgs.avd, "Pixel_8_API_35");
+    assert.equal(preMcpClaimOut.modifiedArgs.session, "cp-1");
+
+    // Even if the host does not forward modifiedArgs into the MCP call, hookSessions resolves cp-1
+    const mcpClaimReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "atc_claim", arguments: { avd: "Pixel_8_API_35" } },
+      },
+      sharedMcpOpts
+    );
+    assert.equal(JSON.parse(mcpClaimReply.result.content[0].text).exitCode, 0);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].sessionId, "cp-1");
+
+    // A second concurrent Copilot chat (cp-2) sharing the same MCP server cannot free cp-1's lease
+    const preMcpFreeOther = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        sessionId: "cp-2",
+        cwd: process.cwd(),
+        toolName: "atc-atc_free",
+        toolArgs: {},
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(preMcpFreeOther.exitCode, 0);
+    assert.equal(JSON.parse(preMcpFreeOther.stdout).modifiedArgs.session, "cp-2");
+    const mcpFreeOtherReply = handleMcpRequest(
+      dir,
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "atc_free", arguments: {} },
+      },
+      sharedMcpOpts
+    );
+    assert.deepEqual(JSON.parse(mcpFreeOtherReply.result.content[0].text).freed, []);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].sessionId, "cp-1");
+
     // sessionEnd with reason "complete" fires after every Copilot turn: keep the lease.
     // A terminal reason (user_exit/abort/error/timeout) releases it.
-    cmdClaim(
-      dir,
-      { session: "cp-1", avd: "Pixel_8_API_35" },
-      {
-        inventory: {
-          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
-          running: [
-            {
-              deviceKey: "avd:Pixel_8_API_35",
-              avd: "Pixel_8_API_35",
-              serial: "emulator-5554",
-              kind: "emulator",
-              online: true,
-              profile: { deviceType: "phone", apiLevel: "android-35" },
-            },
-          ],
-          offline: [],
-          creatable: [],
-        },
-      }
-    );
     const stopOpts = {
       ppid: process.pid,
       host: { freeDiskMb: 65536 },

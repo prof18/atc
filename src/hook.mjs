@@ -24,23 +24,37 @@ export function parseHookInput(rawStdin) {
   }
 }
 
+const ATC_MCP_TOOL_RE = /(?:^|[_:/.-])(atc_(?:claim|free|renew|snapshot|status|guide))$/i;
+const ATC_SESSION_MCP_TOOLS = new Set(["atc_claim", "atc_free", "atc_renew", "atc_snapshot"]);
+
+function matchAtcMcpTool(toolName) {
+  if (typeof toolName !== "string" || !toolName) return null;
+  const m = toolName.match(ATC_MCP_TOOL_RE);
+  return m ? m[1].toLowerCase() : null;
+}
+
 export function normalizeHookPayload(payload, ppid = process.ppid) {
   if (!payload || typeof payload !== "object") {
-    return { isShellTool: false };
+    return { isShellTool: false, mcpToolName: null };
   }
 
   // Antigravity / Gemini CLI format
   if (payload.toolCall && typeof payload.toolCall === "object") {
     const name = String(payload.toolCall.name || "");
-    const args = payload.toolCall.args || {};
+    const args =
+      payload.toolCall.args && typeof payload.toolCall.args === "object"
+        ? payload.toolCall.args
+        : {};
     const command = args.CommandLine ?? args.command ?? "";
     const rawSession = payload.conversationId || payload.session_id || `ppid-${ppid}`;
     return {
       hostFormat: "antigravity",
       isShellTool: name === "run_command" || name === "bash" || name === "shell",
+      mcpToolName: matchAtcMcpTool(name),
       command: typeof command === "string" ? command : "",
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
+      toolInput: args,
     };
   }
 
@@ -58,6 +72,7 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
     return {
       hostFormat: "cursor",
       isShellTool: true,
+      mcpToolName: null,
       command: typeof payload.command === "string" ? payload.command : "",
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
@@ -79,6 +94,7 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
     return {
       hostFormat: "copilot",
       isShellTool: /^(bash|shell)$/i.test(payload.toolName),
+      mcpToolName: matchAtcMcpTool(payload.toolName),
       command: typeof toolArgs.command === "string" ? toolArgs.command : "",
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
@@ -88,7 +104,8 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
 
   // Claude Code / Codex format
   const toolName = String(payload.tool_name || payload.toolName || "");
-  const toolInput = payload.tool_input || payload.input || {};
+  const rawInput = payload.tool_input || payload.input || {};
+  const toolInput = rawInput && typeof rawInput === "object" ? rawInput : {};
   const command = toolInput.command ?? toolInput.CommandLine ?? "";
   const rawSession =
     payload.session_id ||
@@ -99,6 +116,7 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
   return {
     hostFormat: "standard",
     isShellTool: /^(bash|shell|run_command|terminal)$/i.test(toolName),
+    mcpToolName: matchAtcMcpTool(toolName),
     command: typeof command === "string" ? command : "",
     sessionId: sanitizeSessionId(rawSession, ppid),
     anchorPid: ppid,
@@ -120,6 +138,57 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const fastNorm = normalizeHookPayload(payload, rawPpid);
   const cursorAllowOut =
     fastNorm.hostFormat === "cursor" ? JSON.stringify({ permission: "allow" }) + "\n" : "";
+
+  if (fastNorm.mcpToolName) {
+    getAncestorPids(rawPpid);
+    const norm = normalizeHookPayload(
+      payload,
+      resolveStableParentPid(rawPpid, options.processChain),
+    );
+    const cwd =
+      options.cwd ||
+      (typeof payload?.cwd === "string" && payload.cwd.trim() ? payload.cwd : process.cwd());
+    withStateTransaction(
+      stateDir,
+      (state, { now }) => {
+        state.hookSessions[String(norm.anchorPid)] = {
+          sessionId: norm.sessionId,
+          agentPid: norm.anchorPid,
+          cwd,
+          updatedAtMs: now,
+        };
+        return { mutated: true };
+      },
+      { ppid: norm.anchorPid },
+    );
+
+    if (
+      ATC_SESSION_MCP_TOOLS.has(norm.mcpToolName) &&
+      !norm.toolInput?.session &&
+      !norm.toolInput?.role
+    ) {
+      const updatedArgs = { ...norm.toolInput, session: norm.sessionId };
+      const allowMcpJson =
+        norm.hostFormat === "antigravity"
+          ? { overwrite: updatedArgs }
+          : norm.hostFormat === "copilot"
+            ? { permissionDecision: "allow", modifiedArgs: updatedArgs }
+            : {
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "allow",
+                  updatedInput: updatedArgs,
+                },
+              };
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(allowMcpJson) + "\n",
+        stderr: "",
+      };
+    }
+    return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
+  }
+
   if (!fastNorm.isShellTool || !fastNorm.command) {
     return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
   }

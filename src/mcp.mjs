@@ -126,11 +126,18 @@ export const MCP_TOOLS = [
   },
 ];
 
-function resolveMcpCallOptions(sessionOptions = {}) {
+function resolveMcpCallOptions(sessionOptions = {}, toolArgs = {}) {
   const hostAgentPid = sessionOptions.ppid ?? process.ppid;
   const mcpPid = sessionOptions.pid ?? process.pid;
   const baseEnv = sessionOptions.env || process.env;
+  const argSession =
+    typeof toolArgs?.session === "string" && toolArgs.session.trim()
+      ? toolArgs.session.trim()
+      : typeof toolArgs?.role === "string" && toolArgs.role.trim()
+        ? toolArgs.role.trim()
+        : null;
   const explicitSession =
+    argSession ||
     sessionOptions.sessionId ||
     sessionOptions.flags?.session ||
     sessionOptions.flags?.role ||
@@ -147,6 +154,8 @@ function resolveMcpCallOptions(sessionOptions = {}) {
     baseEnv.ANTIGRAVITY_CONVERSATION_ID ||
     baseEnv.GEMINI_SESSION_ID ||
     baseEnv.CLAUDE_SESSION_ID ||
+    baseEnv.COPILOT_SESSION_ID ||
+    baseEnv.GITHUB_COPILOT_SESSION_ID ||
     baseEnv.CONVERSATION_ID ||
     `mcp-${mcpPid}`;
   const mcpEnv = {
@@ -169,7 +178,9 @@ function resolveMcpCallOptions(sessionOptions = {}) {
 export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
   if (!msg || typeof msg !== "object") return null;
   const { id, method, params } = msg;
-  const callOptions = resolveMcpCallOptions(sessionOptions);
+  const args =
+    params?.arguments && typeof params.arguments === "object" ? params.arguments : {};
+  const callOptions = resolveMcpCallOptions(sessionOptions, args);
 
   if (method === "initialize") {
     return {
@@ -200,7 +211,6 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
 
   if (method === "tools/call") {
     const toolName = params?.name;
-    const args = params?.arguments || {};
     let res;
     if (toolName === "atc_claim") {
       res = cmdClaim(
@@ -279,7 +289,7 @@ export function startMcpServer(stateDir, sessionOptions = {}) {
         return;
       }
       try {
-        const reply = handleMcpRequest(stateDir, msg, serverOptions);
+        const reply = handleMcpRequest(stateDir, msg, sessionOptions);
         if (reply) {
           process.stdout.write(JSON.stringify(reply) + "\n");
         }

@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|run_command|shell",
+        "matcher": "Bash|run_command|shell|.*atc_(claim|free|renew|snapshot|status|guide)",
         "hooks": [
           {
             "type": "command",
