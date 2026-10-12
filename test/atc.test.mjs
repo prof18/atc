@@ -737,6 +737,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "./adb.log shell getprop",
     "adb\\\n shell getprop",
     "@adb shell pm clear com.x",
+    "npx adb@1.0.0 shell pm clear com.x",
+    "npm exec -- @scope/adb@2 shell pm clear com.x",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
@@ -753,6 +755,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "python3 scripts/adb.json kill-server",
     "@adb kill-server",
     'cmd.exe /c "@adb kill-server"',
+    "npx adb@1.0.0 kill-server",
+    "npx @scope/adb@2 kill-server",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
   }
@@ -765,6 +769,18 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   const atcRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "linux" });
   assert.equal(atcRes.allowed, true);
   assert.match(atcRes.rewrittenCommand || "", /ATC_SESSION_ID=sess-unleased/);
+  const atcNpxRes = evaluateCommandGuard("npx @rock3r/atc@2 free", {
+    ...opts,
+    platform: "linux",
+  });
+  assert.equal(atcNpxRes.allowed, true);
+  assert.match(atcNpxRes.rewrittenCommand || "", /ATC_SESSION_ID=sess-unleased/);
+  const atcNpxWinRes = evaluateCommandGuard("npx @rock3r/atc@2 free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcNpxWinRes.allowed, true);
+  assert.equal(atcNpxWinRes.rewrittenCommand, "npx @rock3r/atc@2 free --session sess-unleased");
   const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
   assert.equal(atcWinRes.allowed, true);
   assert.match(atcWinRes.rewrittenCommand || "", /--session sess-unleased/);
@@ -785,6 +801,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   assert.equal(
     atcWinTitleRes.rewrittenCommand,
     "node --title=atc.exe bin/atc.mjs free --session sess-unleased",
+  );
+  const atcWinSepTitleRes = evaluateCommandGuard("node --title atc.exe bin/atc.mjs free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcWinSepTitleRes.allowed, true);
+  assert.equal(
+    atcWinSepTitleRes.rewrittenCommand,
+    "node --title atc.exe bin/atc.mjs free --session sess-unleased",
   );
 });
 

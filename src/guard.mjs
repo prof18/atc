@@ -5,14 +5,82 @@ const TOOL_NAMES_RE_SRC =
   "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
 const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_]+";
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
+const NPM_VERSION_TAG_RE_SRC =
+  "(?:[0-9~^v][A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*[0-9][A-Za-z0-9_.-]*|latest|next|beta|alpha|canary|rc|dev|nightly)";
+const NPM_VERSION_TAG_STRIP_RE = new RegExp(`@${NPM_VERSION_TAG_RE_SRC}$`, "i");
 // Stricter than FAST_PATH_REGEX: the tool name must be a standalone token or executable basename
 // (`adb`, `@adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `bin/atc.mjs`, `scripts/adb.py`, `scripts/adb.command`,
-// `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a directory segment or fragment of a longer
-// word/identifier (`my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
+// `npx @rock3r/atc@2`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a directory segment or fragment
+// of a longer word/identifier (`my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
 const STANDALONE_TOOL_REGEX = new RegExp(
-  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_]))?(?![A-Za-z0-9_.@/\\\\-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
+  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_])|@${NPM_VERSION_TAG_RE_SRC}(?![A-Za-z0-9_.-]))?(?![A-Za-z0-9_.@/\\\\-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
   "i",
 );
+const NODE_VALUE_FLAGS = new Set([
+  "-C",
+  "--conditions",
+  "--input-type",
+  "--title",
+  "--dns-result-order",
+  "--unhandled-rejections",
+  "--use-largepages",
+  "--disable-proto",
+  "--disable-warning",
+  "--redirect-warnings",
+  "--diagnostic-dir",
+  "--cpu-prof-dir",
+  "--cpu-prof-name",
+  "--cpu-prof-interval",
+  "--heap-prof-dir",
+  "--heap-prof-name",
+  "--heap-prof-interval",
+  "--heapsnapshot-near-heap-limit",
+  "--heapsnapshot-signal",
+  "--report-dir",
+  "--report-directory",
+  "--report-filename",
+  "--report-signal",
+  "--env-file",
+  "--env-file-if-exists",
+  "--openssl-config",
+  "--tls-cipher-list",
+  "--tls-keylog",
+  "--icu-data-dir",
+  "--localstorage-file",
+  "--max-http-header-size",
+  "--network-family-autoselection-attempt-timeout",
+  "--secure-heap",
+  "--secure-heap-min",
+  "--snapshot-blob",
+  "--build-snapshot-config",
+  "--experimental-config-file",
+  "--experimental-default-type",
+  "--experimental-sea-config",
+  "--experimental-test-isolation",
+  "--test-concurrency",
+  "--test-coverage-branches",
+  "--test-coverage-exclude",
+  "--test-coverage-functions",
+  "--test-coverage-include",
+  "--test-coverage-lines",
+  "--test-name-pattern",
+  "--test-reporter",
+  "--test-reporter-destination",
+  "--test-shard",
+  "--test-skip-pattern",
+  "--test-timeout",
+  "--trace-event-categories",
+  "--trace-event-file-pattern",
+  "--trace-require-module",
+  "--v8-pool-size",
+  "--watch-kill-signal",
+  "--watch-path",
+  "--allow-fs-read",
+  "--allow-fs-write",
+  "--inspect-port",
+  "--debug-port",
+  "--inspect-publish-uid",
+]);
 const TRANSPARENT_WRAPPERS = new Set([
   "env",
   "command",
@@ -23,6 +91,7 @@ const TRANSPARENT_WRAPPERS = new Set([
   "nice",
   "time",
   "npx",
+  "bunx",
   "then",
   "else",
   "do",
@@ -194,11 +263,17 @@ function decodeShellEscapes(str) {
   );
 }
 
-function extractExecutableBase(tok) {
+function extractExecutableBase(tok, { allowPackageSpec = false } = {}) {
   if (!tok || typeof tok !== "string") return "";
+  const isScopedPkg = /^@[A-Za-z0-9_.-]+\//.test(tok);
   const cleaned = tok.replace(/^@+/, "");
-  const file = cleaned.split(/[\\/]/).pop() || "";
+  let file = cleaned.split(/[\\/]/).pop() || "";
   if (!file || /[\s"'`();|&[\]{},<>]/.test(file)) return "";
+  if (allowPackageSpec || isScopedPkg) {
+    file = file.replace(/@[A-Za-z0-9._~^>=<+-]+$/, "");
+  } else {
+    file = file.replace(NPM_VERSION_TAG_STRIP_RE, "");
+  }
   return file.replace(TOOL_EXEC_EXT_STRIP_RE, "").toLowerCase();
 }
 
@@ -1094,6 +1169,7 @@ export function parseSegment(segment, inheritedVars = {}) {
   let baseVars = { ...inheritedVars };
   const envVars = {};
   let stripsAndroidSerial = Boolean(inheritedVars.__atc_stripped_android_serial);
+  let isPackageExec = false;
   let idx = 0;
 
   while (idx < tokens.length) {
@@ -1292,6 +1368,59 @@ export function parseSegment(segment, inheritedVars = {}) {
             idx++;
           }
         }
+      } else if (base === "npx" || base === "bunx") {
+        isPackageExec = true;
+        while (idx < tokens.length && tokens[idx].startsWith("-")) {
+          const flag = tokens[idx++];
+          if (flag === "--") break;
+          if (
+            (flag === "-c" || flag === "--call" || flag === "--shell" || flag === "--prefix") &&
+            idx < tokens.length
+          ) {
+            idx++;
+          } else if (
+            (flag === "-p" || flag === "--package") &&
+            idx + 1 < tokens.length &&
+            (TOOL_NAMES.includes(
+              extractExecutableBase(tokens[idx + 1], { allowPackageSpec: true }),
+            ) ||
+              !TOOL_NAMES.includes(extractExecutableBase(tokens[idx], { allowPackageSpec: true })))
+          ) {
+            idx++;
+          }
+        }
+      }
+      continue;
+    }
+    if (
+      (base === "npm" && (tokens[idx + 1] === "exec" || tokens[idx + 1] === "x")) ||
+      ((base === "pnpm" || base === "yarn") &&
+        (tokens[idx + 1] === "dlx" || tokens[idx + 1] === "exec"))
+    ) {
+      idx += 2;
+      isPackageExec = true;
+      while (idx < tokens.length && tokens[idx].startsWith("-")) {
+        const flag = tokens[idx++];
+        if (flag === "--") break;
+        if (
+          (flag === "-c" ||
+            flag === "--call" ||
+            flag === "-w" ||
+            flag === "--workspace" ||
+            flag === "--prefix") &&
+          idx < tokens.length
+        ) {
+          idx++;
+        } else if (
+          (flag === "-p" || flag === "--package") &&
+          idx + 1 < tokens.length &&
+          (TOOL_NAMES.includes(
+            extractExecutableBase(tokens[idx + 1], { allowPackageSpec: true }),
+          ) ||
+            !TOOL_NAMES.includes(extractExecutableBase(tokens[idx], { allowPackageSpec: true })))
+        ) {
+          idx++;
+        }
       }
       continue;
     }
@@ -1306,6 +1435,9 @@ export function parseSegment(segment, inheritedVars = {}) {
     if (splitCmdTokens.length > 0) {
       remaining.splice(0, 1, ...splitCmdTokens);
     }
+  }
+  if (isPackageExec && remaining[1] === "--") {
+    remaining.splice(1, 1);
   }
   while (
     remaining.length > 1 &&
@@ -1326,7 +1458,8 @@ export function parseSegment(segment, inheritedVars = {}) {
   }
   const cmd = remaining[0] || "";
   const baseCmd =
-    extractExecutableBase(cmd) || (cmd.split(/[\\/]/).pop() || cmd).toLowerCase();
+    extractExecutableBase(cmd, { allowPackageSpec: isPackageExec }) ||
+    (cmd.split(/[\\/]/).pop() || cmd).toLowerCase();
   const args = remaining.slice(1);
   return {
     raw: expandVariables(segment, allVars),
@@ -2144,8 +2277,13 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     matchesAndroidOrAtcText(effectiveSegment, parsed.envVars, STANDALONE_TOOL_REGEX)
   ) {
     const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
-    const nestedRelIdx = args.slice(startSearchIdx).findIndex((a) => {
+    const searchArgs = args.slice(startSearchIdx);
+    const isNodeCmd = baseCmd === "node" || baseCmd === "nodejs";
+    const nestedRelIdx = searchArgs.findIndex((a, i) => {
       if (!a) return false;
+      if (isNodeCmd && i > 0 && NODE_VALUE_FLAGS.has(searchArgs[i - 1])) {
+        return false;
+      }
       const b = extractExecutableBase(a);
       return (
         [
@@ -4671,9 +4809,28 @@ function rewriteCompoundCommand(
           const escapedCmd = (c.parsed.cmd || "atc").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           const cmdRe = new RegExp(
             `((?:^|\\s)["']?${escapedCmd}["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|$)`,
-            "i",
+            "gi",
           );
-          return trimmed.replace(cmdRe, `$1 ${sessionFlags}`);
+          let match;
+          let chosenMatch = null;
+          while ((match = cmdRe.exec(trimmed)) !== null) {
+            const before = trimmed.slice(0, match.index).trimEnd();
+            const prevTok = before.split(/\s+/).pop() || "";
+            if (NODE_VALUE_FLAGS.has(prevTok) || prevTok === "-p" || prevTok === "--package") {
+              cmdRe.lastIndex = match.index + 1;
+              continue;
+            }
+            chosenMatch = { index: match.index, text: match[0] };
+            break;
+          }
+          if (chosenMatch) {
+            return (
+              trimmed.slice(0, chosenMatch.index) +
+              `${chosenMatch.text} ${sessionFlags}` +
+              trimmed.slice(chosenMatch.index + chosenMatch.text.length)
+            );
+          }
+          return trimmed;
         }
       }
       finishLoopDepth();
