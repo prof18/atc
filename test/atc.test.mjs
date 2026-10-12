@@ -743,6 +743,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "npm exec -c 'adb shell getprop'",
     "npx --call='adb shell getprop'",
     "npm exec --package adb@2 -- adb shell getprop",
+    "pnpm dlx -c adb kill-server",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
   }
@@ -765,6 +766,8 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "npx --call='adb kill-server'",
     "npm exec --package adb@2 -- adb kill-server",
     "npx -p adb@2 -- adb kill-server",
+    "pnpm dlx -c adb kill-server",
+    `node -e 'require("child_process").spawnSync(process.argv[2],process.argv.slice(3))' -- --title adb kill-server`,
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
   }
@@ -789,6 +792,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   });
   assert.equal(atcNpxWinRes.allowed, true);
   assert.equal(atcNpxWinRes.rewrittenCommand, "npx @rock3r/atc@2 free --session sess-unleased");
+  const atcNpxCallWinRes = evaluateCommandGuard("npx --call='atc free'", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcNpxCallWinRes.allowed, true);
+  assert.equal(
+    atcNpxCallWinRes.rewrittenCommand,
+    "npx --call='atc free --session sess-unleased'",
+  );
   const atcNpmPkgWinRes = evaluateCommandGuard("npm exec --package @rock3r/atc@2 -- atc free", {
     ...opts,
     platform: "win32",

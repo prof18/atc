@@ -1373,14 +1373,17 @@ export function parseSegment(segment, inheritedVars = {}) {
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx++];
           if (flag === "--") break;
-          if (flag === "-c" || flag === "--call") {
+          if (base === "npx" && (flag === "-c" || flag === "--call")) {
             const callStr = tokens[idx] || "";
             if (idx < tokens.length) {
               tokens.splice(idx, 1, "sh", "-c", callStr);
             }
             break;
           }
-          if (flag.startsWith("--call=") || (flag.startsWith("-c=") && flag.length > 3)) {
+          if (
+            base === "npx" &&
+            (flag.startsWith("--call=") || (flag.startsWith("-c=") && flag.length > 3))
+          ) {
             const callStr = flag.slice(flag.indexOf("=") + 1);
             tokens.splice(idx, 0, "sh", "-c", callStr);
             break;
@@ -1414,14 +1417,17 @@ export function parseSegment(segment, inheritedVars = {}) {
       while (idx < tokens.length && tokens[idx].startsWith("-")) {
         const flag = tokens[idx++];
         if (flag === "--") break;
-        if (flag === "-c" || flag === "--call") {
+        if (base === "npm" && (flag === "-c" || flag === "--call")) {
           const callStr = tokens[idx] || "";
           if (idx < tokens.length) {
             tokens.splice(idx, 1, "sh", "-c", callStr);
           }
           break;
         }
-        if (flag.startsWith("--call=") || (flag.startsWith("-c=") && flag.length > 3)) {
+        if (
+          base === "npm" &&
+          (flag.startsWith("--call=") || (flag.startsWith("-c=") && flag.length > 3))
+        ) {
           const callStr = flag.slice(flag.indexOf("=") + 1);
           tokens.splice(idx, 0, "sh", "-c", callStr);
           break;
@@ -2305,9 +2311,44 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
     const searchArgs = args.slice(startSearchIdx);
     const isNodeCmd = baseCmd === "node" || baseCmd === "nodejs";
+    const nodeOptValueIndices = new Set();
+    if (isNodeCmd) {
+      for (let i = 0; i < searchArgs.length; i++) {
+        const tok = searchArgs[i];
+        if (!tok || tok === "--" || tok === "-") break;
+        if (
+          tok === "-e" ||
+          tok === "--eval" ||
+          tok === "-p" ||
+          tok === "--print" ||
+          tok.startsWith("--eval=") ||
+          tok.startsWith("--print=")
+        ) {
+          break;
+        }
+        if (NODE_VALUE_FLAGS.has(tok) && i + 1 < searchArgs.length) {
+          nodeOptValueIndices.add(i + 1);
+          i += 1;
+          continue;
+        }
+        if (
+          (tok === "-r" ||
+            tok === "--require" ||
+            tok === "--import" ||
+            tok === "--loader" ||
+            tok === "--experimental-loader") &&
+          i + 1 < searchArgs.length
+        ) {
+          i += 1;
+          continue;
+        }
+        if (tok.startsWith("-")) continue;
+        break;
+      }
+    }
     const nestedRelIdx = searchArgs.findIndex((a, i) => {
       if (!a) return false;
-      if (isNodeCmd && i > 0 && NODE_VALUE_FLAGS.has(searchArgs[i - 1])) {
+      if (nodeOptValueIndices.has(i)) {
         return false;
       }
       const b = extractExecutableBase(a);
@@ -4834,7 +4875,7 @@ function rewriteCompoundCommand(
           finishLoopDepth();
           const escapedCmd = (c.parsed.cmd || "atc").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           const cmdRe = new RegExp(
-            `((?:^|\\s)["']?${escapedCmd}["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|$)`,
+            `((?:^|[\\s=])["']?${escapedCmd}["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|["']|$)`,
             "gi",
           );
           let match;
