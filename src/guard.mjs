@@ -5839,7 +5839,7 @@ function rewriteCompoundCommand(
             : "";
         return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${stageExecSerial} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
       }
-      if (c.kind === "atc" && sessionFlags) {
+      if (c.kind === "atc" && c.subcommand && sessionFlags) {
         const hasSession =
           Boolean(c.parsed.envVars.ATC_SESSION_ID) ||
           c.parsed.args.some(
@@ -5853,7 +5853,7 @@ function rewriteCompoundCommand(
           finishLoopDepth();
           const escapedCmd = (c.parsed.cmd || "atc").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           const cmdRe = new RegExp(
-            `((?:^|[\\s=])["']?${escapedCmd}["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|["']|$)`,
+            `((?:^|[\\s=])["']?${escapedCmd}["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*|(?=\\s)))(?=\\s|["']|$)`,
             "gi",
           );
           let match;
@@ -5861,7 +5861,7 @@ function rewriteCompoundCommand(
           while ((match = cmdRe.exec(trimmed)) !== null) {
             const before = trimmed.slice(0, match.index).trimEnd();
             const prevTok = before.split(/\s+/).pop() || "";
-            if (WRAPPER_VALUE_FLAGS.has(prevTok)) {
+            if (WRAPPER_VALUE_FLAGS.has(prevTok) || prevTok.toLowerCase() === "ssh") {
               cmdRe.lastIndex = match.index + 1;
               continue;
             }

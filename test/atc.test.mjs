@@ -992,6 +992,12 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     atcExecEchoWinRes.rewrittenCommand,
     "atc exec --session sess-unleased -- echo atc",
   );
+  const sshAtcWinRes = evaluateCommandGuard("ssh atc", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(sshAtcWinRes.allowed, true);
+  assert.equal(sshAtcWinRes.rewrittenCommand, "ssh atc");
   const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
   assert.equal(atcWinRes.allowed, true);
   assert.match(atcWinRes.rewrittenCommand || "", /--session sess-unleased/);
