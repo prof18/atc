@@ -705,6 +705,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "node scripts/build.mjs --out dist/gradle-report.html",
     "node script.mjs 'a\\\ndb shell'",
     "cat <<'EOF'\na\\\ndb shell\nEOF",
+    "cat <<EOF\na\\\ndb shell\nEOF",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, true, cmd);
   }
@@ -737,7 +738,10 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "bash scripts/adb.command shell pm clear com.x",
     "python3 scripts/adb.txt shell getprop",
     "./adb.log shell getprop",
+    "./adb.foo-bar shell getprop",
     "adb\\\n shell getprop",
+    "sh <<EOF\na\\\ndb shell\nEOF",
+    "cat <<EOF | sh\na\\\ndb shell\nEOF",
     "@adb shell pm clear com.x",
     "npx adb@1.0.0 shell pm clear com.x",
     "npm exec -- @scope/adb@2 shell pm clear com.x",
@@ -760,6 +764,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "ruby -e 'system(*%w-adb kill-server-)'",
     "python3 scripts/adb.py kill-server",
     "python3 scripts/adb.json kill-server",
+    "./adb.foo-bar kill-server",
     "@adb kill-server",
     'cmd.exe /c "@adb kill-server"',
     "npx adb@1.0.0 kill-server",
@@ -778,6 +783,7 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "perl -e 'print q!adb kill-server!'",
     "ruby -e 'puts %q!adb kill-server!'",
     "cat <<'EOF'\na\\\ndb shell\nEOF",
+    "cat <<EOF\na\\\ndb shell\nEOF",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, true, cmd);
   }

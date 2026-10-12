@@ -3,7 +3,7 @@ import path from "node:path";
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
 const TOOL_NAMES_RE_SRC =
   "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
-const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_]+";
+const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%-]+";
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
 const NPM_VERSION_TAG_RE_SRC =
   "(?:[0-9~^v][A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*[0-9][A-Za-z0-9_.-]*|latest|next|beta|alpha|canary|rc|dev|nightly)";
@@ -13,7 +13,7 @@ const NPM_VERSION_TAG_STRIP_RE = new RegExp(`@${NPM_VERSION_TAG_RE_SRC}$`, "i");
 // `npx @rock3r/atc@2`, `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a directory segment or fragment
 // of a longer word/identifier (`my-android-app/`, `atc.test.mjs`, `.../atc/hooks.json`, `atc@atc`, `gradle-report.html`).
 const STANDALONE_TOOL_REGEX = new RegExp(
-  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_])|@${NPM_VERSION_TAG_RE_SRC}(?![A-Za-z0-9_.-]))?(?![A-Za-z0-9_.@/\\\\-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
+  `(?:(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]@)${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC}(?![A-Za-z0-9_+~%-])|@${NPM_VERSION_TAG_RE_SRC}(?![A-Za-z0-9_.-]))?(?![A-Za-z0-9_.@/\\\\~%-])|(?:\\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\\s*([^\\w\\s])\\s*@*${TOOL_NAMES_RE_SRC}(?:\\.${TOOL_EXEC_EXT_RE_SRC})?(?=\\s|\\1))`,
   "i",
 );
 const NODE_VALUE_FLAGS = new Set([
@@ -411,7 +411,9 @@ function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") 
 }
 
 function matchQuotedHeredocDelim(str, i) {
-  if (str[i] !== "<" || str[i + 1] !== "<" || str[i + 2] === "<") return null;
+  if (str[i - 1] === "<" || str[i] !== "<" || str[i + 1] !== "<" || str[i + 2] === "<") {
+    return null;
+  }
   let j = i + 2;
   let stripTabs = false;
   if (str[j] === "-") {
@@ -453,7 +455,53 @@ function matchQuotedHeredocDelim(str, i) {
       delim += str[j++];
     }
   }
-  if (!quoted || !delim || j === start) return null;
+  if (!delim || j === start) return null;
+  if (!quoted) {
+    let lineStart = i;
+    while (
+      lineStart > 0 &&
+      str[lineStart - 1] !== "\n" &&
+      str[lineStart - 1] !== ";" &&
+      str[lineStart - 1] !== "&" &&
+      str[lineStart - 1] !== "|"
+    ) {
+      lineStart--;
+    }
+    let lineEnd = j;
+    while (lineEnd < str.length && str[lineEnd] !== "\n") {
+      lineEnd++;
+    }
+    const afterDelim = str.slice(j, lineEnd);
+    if (/(?:^|[^|])\|(?!\|)/.test(afterDelim)) {
+      return null;
+    }
+    const prefix = str
+      .slice(lineStart, i)
+      .trimStart()
+      .replace(LEADING_CONTROL_PREFIX_RE, "");
+    const prefixTokens = prefix
+      .trim()
+      .split(/\s+/)
+      .filter((t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+    while (
+      prefixTokens.length > 0 &&
+      (TRANSPARENT_WRAPPERS.has(extractExecutableBase(prefixTokens[0])) ||
+        prefixTokens[0].startsWith("-"))
+    ) {
+      prefixTokens.shift();
+    }
+    const firstBase = prefixTokens[0] ? extractExecutableBase(prefixTokens[0]) : "";
+    if (
+      !firstBase ||
+      !PASSIVE_NON_EXEC_COMMANDS.has(firstBase) ||
+      firstBase === "sed" ||
+      firstBase === "awk" ||
+      firstBase === "find" ||
+      firstBase === "git"
+    ) {
+      return null;
+    }
+  }
   return { endIdx: j, delim, stripTabs };
 }
 
