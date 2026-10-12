@@ -733,6 +733,9 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
     "perl scripts/adb.pl shell pm clear com.x",
     "ruby scripts/adb.rb shell pm clear com.x",
     "bash scripts/adb.command shell pm clear com.x",
+    "python3 scripts/adb.txt shell getprop",
+    "./adb.log shell getprop",
+    "adb\\\n shell getprop",
     "@adb shell pm clear com.x",
   ]) {
     assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
@@ -745,11 +748,19 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   for (const cmd of [
     `xargs "/opt/Android SDK/platform-tools/adb" kill-server </dev/null`,
     "perl -e 'qx!adb kill-server!'",
+    "ruby -e 'system(*%w-adb kill-server-)'",
     "python3 scripts/adb.py kill-server",
+    "python3 scripts/adb.json kill-server",
     "@adb kill-server",
     'cmd.exe /c "@adb kill-server"',
   ]) {
     assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
+  }
+  for (const cmd of [
+    "perl -e 'print q!adb kill-server!'",
+    "ruby -e 'puts %q!adb kill-server!'",
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, true, cmd);
   }
   const atcRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "linux" });
   assert.equal(atcRes.allowed, true);
@@ -765,6 +776,15 @@ test("guard: tool names embedded in paths or longer words do not fail closed", (
   assert.equal(
     atcWinOptRes.rewrittenCommand,
     "node bin/atc.mjs --session sess-unleased --anchor-pid 42 free",
+  );
+  const atcWinTitleRes = evaluateCommandGuard("node --title=atc.exe bin/atc.mjs free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcWinTitleRes.allowed, true);
+  assert.equal(
+    atcWinTitleRes.rewrittenCommand,
+    "node --title=atc.exe bin/atc.mjs free --session sess-unleased",
   );
 });
 

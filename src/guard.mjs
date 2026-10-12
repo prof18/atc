@@ -3,14 +3,8 @@ import path from "node:path";
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)\b/i;
 const TOOL_NAMES_RE_SRC =
   "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
-const NON_EXEC_EXT_RE_SRC =
-  "(?:json|jsonl|md|markdown|txt|log|ya?ml|toml|ini|cfg|conf|properties|xml|html?|css|scss|less|csv|tsv|sql|lock|map|bak|orig|rej|png|jpe?g|gif|svg|webp|ico|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|wasm|o|a|so|dylib|dll|pdb|class|dex|apk|aab|ipa)";
-const TOOL_EXEC_EXT_RE_SRC = `(?!${NON_EXEC_EXT_RE_SRC}\\b)[A-Za-z0-9_]+`;
+const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_]+";
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
-const ATC_WIN_SESSION_RE = new RegExp(
-  `(?<![A-Za-z0-9_.-])(atc(?:\\.${TOOL_EXEC_EXT_RE_SRC})?["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|$)`,
-  "i",
-);
 // Stricter than FAST_PATH_REGEX: the tool name must be a standalone token or executable basename
 // (`adb`, `@adb`, `/usr/bin/adb`, `C:\sdk\adb.exe`, `bin/atc.mjs`, `scripts/adb.py`, `scripts/adb.command`,
 // `"adb shell"`, `adb</dev/null`, `qx!adb ...!`), not a directory segment or fragment of a longer
@@ -307,8 +301,45 @@ function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") 
   return "__atc_cmd_sub__";
 }
 
-function matchesAndroidOrAtcText(str, inheritedVars = {}, toolRegex = FAST_PATH_REGEX) {
-  if (!str || typeof str !== "string") return false;
+function stripLineContinuations(str) {
+  if (!str || typeof str !== "string" || !str.includes("\\")) return str;
+  let out = "";
+  let inSingle = false;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (ch === "'" && !inSingle) {
+      inSingle = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "'" && inSingle) {
+      inSingle = false;
+      out += ch;
+      continue;
+    }
+    if (!inSingle && ch === "\\") {
+      if (str[i + 1] === "\n") {
+        i++;
+        continue;
+      }
+      if (str[i + 1] === "\r" && str[i + 2] === "\n") {
+        i += 2;
+        continue;
+      }
+      if (i + 1 < str.length) {
+        out += ch + str[i + 1];
+        i++;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function matchesAndroidOrAtcText(rawStr, inheritedVars = {}, toolRegex = FAST_PATH_REGEX) {
+  if (!rawStr || typeof rawStr !== "string") return false;
+  const str = rawStr.replace(/\\\r?\n/g, "");
   if (toolRegex.test(str)) return true;
   const subExpanded =
     str.includes("$") || str.includes("`") ? extractCommandSubstitutions(str, []) : str;
@@ -447,6 +478,14 @@ function splitOutsideQuotes(str, sepType) {
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
     if (ch === "\\" && !inSingle && i + 1 < str.length) {
+      if (str[i + 1] === "\n") {
+        i++;
+        continue;
+      }
+      if (str[i + 1] === "\r" && str[i + 2] === "\n") {
+        i += 2;
+        continue;
+      }
       cur += ch + str[i + 1];
       i++;
       continue;
@@ -683,7 +722,7 @@ export function splitShellSegments(command) {
 
 export function tokenizeSegment(segment, { preserveLiteralDollar = false } = {}) {
   const tokens = [];
-  const str = String(segment || "");
+  const str = stripLineContinuations(String(segment || ""));
   const isWinPathLike = (s) => /^(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
   let i = 0;
   while (i < str.length) {
@@ -2194,12 +2233,19 @@ function extractEmbeddedCommands(args) {
       const lit = m[1] ?? m[2] ?? m[3] ?? "";
       if (lit) literals.push(lit);
     }
-    const quoteLikeSymRe = /(?:\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\s*([^\w\s()[\]{}<>])([\s\S]*?)\1/g;
+    const execQuotePrefix =
+      "(?:\\bqx|%x|(?:system|exec|spawn)\\s*\\(\\s*\\*?\\s*(?:\\b(?:qq?|qw)|%[qQwW]?))";
+    const quoteLikeSymRe = new RegExp(
+      `${execQuotePrefix}\\s*([^\\w\\s()[\\]{}<>])([\\s\\S]+?)\\1(?=[);,\\s\\]}]|$)`,
+      "g",
+    );
     while ((m = quoteLikeSymRe.exec(arg)) !== null) {
       if (m[2]) literals.push(m[2]);
     }
-    const quoteLikeBrkRe =
-      /(?:\b(?:qx|qq|qw|q)|%[xwqQWIrs]?)\s*(?:\(([^)]*)\)|\[([^\]]*)\]|\{([^}]*)\}|<([^>]*)>)/g;
+    const quoteLikeBrkRe = new RegExp(
+      `${execQuotePrefix}\\s*(?:\\(([^)]*)\\)|\\[([^\\]]*)\\]|\\{([^}]*)\\}|<([^>]*)>)`,
+      "g",
+    );
     while ((m = quoteLikeBrkRe.exec(arg)) !== null) {
       const lit = m[1] ?? m[2] ?? m[3] ?? m[4] ?? "";
       if (lit) literals.push(lit);
@@ -4622,7 +4668,12 @@ function rewriteCompoundCommand(
           );
         if (!hasSession) {
           finishLoopDepth();
-          return trimmed.replace(ATC_WIN_SESSION_RE, `$1 ${sessionFlags}`);
+          const escapedCmd = (c.parsed.cmd || "atc").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const cmdRe = new RegExp(
+            `((?:^|\\s)["']?${escapedCmd}["']?(?:\\s+[A-Za-z][A-Za-z0-9_-]*)?)(?=\\s|$)`,
+            "i",
+          );
+          return trimmed.replace(cmdRe, `$1 ${sessionFlags}`);
         }
       }
       finishLoopDepth();
