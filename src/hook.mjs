@@ -10,6 +10,7 @@ import {
 import { runCommandSync } from "./spawn.mjs";
 import {
   getAncestorPids,
+  recordHookSession,
   resolveStableParentPid,
   validateSessionId,
   withStateTransaction,
@@ -151,12 +152,14 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     withStateTransaction(
       stateDir,
       (state, { now }) => {
-        state.hookSessions[String(norm.anchorPid)] = {
+        recordHookSession(state, {
+          anchorPid: norm.anchorPid,
           sessionId: norm.sessionId,
-          agentPid: norm.anchorPid,
           cwd,
-          updatedAtMs: now,
-        };
+          now,
+          mcpToolName: norm.mcpToolName,
+          mcpToolInput: norm.toolInput,
+        });
         return { mutated: true };
       },
       { ppid: norm.anchorPid },
@@ -255,12 +258,14 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const evalResult = withStateTransaction(
     stateDir,
     (state, { now }) => {
-      state.hookSessions[String(norm.anchorPid)] = {
+      const hookEntry = recordHookSession(state, {
+        anchorPid: norm.anchorPid,
         sessionId: norm.sessionId,
-        agentPid: norm.anchorPid,
         cwd,
-        updatedAtMs: now,
-      };
+        now,
+      });
+      const singleSessionOnAnchor =
+        !Array.isArray(hookEntry.seenSessions) || hookEntry.seenSessions.length <= 1;
 
       const fallbackPpidSession = `ppid-${norm.anchorPid}`;
       const candidateFallbackSessions = new Set(
@@ -275,7 +280,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
           )
           .map((l) => l.sessionId),
       );
-      if (candidateFallbackSessions.size === 1) {
+      if (candidateFallbackSessions.size === 1 && singleSessionOnAnchor) {
         for (const l of Object.values(state.leases)) {
           if (l.state === "active" && candidateFallbackSessions.has(l.sessionId)) {
             if (String(l.sessionId).startsWith("mcp-")) {
@@ -441,13 +446,34 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
   const targetSessionId = withStateTransaction(
     stateDir,
     (state) => {
+      const existingHook = state.hookSessions[String(ppid)];
+      const existingSeen = Array.isArray(existingHook?.seenSessions)
+        ? existingHook.seenSessions
+        : existingHook?.sessionId
+          ? [existingHook.sessionId]
+          : [];
       let resolvedId = rawSession ? sanitizeSessionId(rawSession, ppid) : null;
-      if (!resolvedId && state.hookSessions[String(ppid)]) {
-        resolvedId = state.hookSessions[String(ppid)].sessionId;
+      if (!resolvedId && existingHook && existingSeen.length <= 1) {
+        resolvedId = existingHook.sessionId;
       }
       const fallbackPpidSession = `ppid-${ppid}`;
-      let mutated = Boolean(state.hookSessions[String(ppid)]);
-      delete state.hookSessions[String(ppid)];
+      let mutated = Boolean(existingHook);
+      if (existingHook) {
+        const remainingSessions = resolvedId
+          ? existingSeen.filter((s) => s !== resolvedId)
+          : [];
+        if (remainingSessions.length > 0) {
+          existingHook.seenSessions = remainingSessions;
+          existingHook.sessionId = remainingSessions[remainingSessions.length - 1];
+          if (Array.isArray(existingHook.pendingMcpCalls)) {
+            existingHook.pendingMcpCalls = existingHook.pendingMcpCalls.filter(
+              (item) => item && item.sessionId !== resolvedId,
+            );
+          }
+        } else {
+          delete state.hookSessions[String(ppid)];
+        }
+      }
 
       const candidateFallbackSessions = new Set(
         Object.values(state.leases)
@@ -461,7 +487,7 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
           )
           .map((l) => l.sessionId),
       );
-      if (candidateFallbackSessions.size === 1) {
+      if (candidateFallbackSessions.size === 1 && existingSeen.length <= 1) {
         for (const l of Object.values(state.leases)) {
           if (l.state === "active" && candidateFallbackSessions.has(l.sessionId)) {
             if (resolvedId) {

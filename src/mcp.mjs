@@ -1,6 +1,7 @@
 import readline from "node:readline";
 import { cmdClaim, cmdFree, cmdRenew, cmdSnapshot, cmdStatus } from "./cli.mjs";
 import { GUIDE_TOPICS, cmdGuide } from "./guide.mjs";
+import { consumePendingMcpHookSession } from "./state.mjs";
 
 export const MCP_TOOLS = [
   {
@@ -144,7 +145,7 @@ function resolveMcpCallOptions(sessionOptions = {}, toolArgs = {}) {
     null;
   const explicitAnchorPid =
     sessionOptions.anchorPid ?? sessionOptions.flags?.anchorPid ?? null;
-  const defaultSessionId =
+  const ambientSessionId =
     explicitSession ||
     baseEnv.ATC_SESSION_ID ||
     baseEnv.CODEX_SESSION_ID ||
@@ -157,18 +158,26 @@ function resolveMcpCallOptions(sessionOptions = {}, toolArgs = {}) {
     baseEnv.COPILOT_SESSION_ID ||
     baseEnv.GITHUB_COPILOT_SESSION_ID ||
     baseEnv.CONVERSATION_ID ||
-    `mcp-${mcpPid}`;
+    null;
+  const fallbackSessionId = `mcp-${mcpPid}`;
+  const defaultSessionId = ambientSessionId || fallbackSessionId;
   const mcpEnv = {
     ...baseEnv,
-    ATC_SESSION_ID: defaultSessionId,
+    ATC_MCP_DEFAULT_SESSION_ID: fallbackSessionId,
     ATC_ANCHOR_PID:
       explicitAnchorPid !== null && explicitAnchorPid !== undefined
         ? String(explicitAnchorPid)
         : baseEnv.ATC_ANCHOR_PID || String(mcpPid),
   };
+  if (ambientSessionId) {
+    mcpEnv.ATC_SESSION_ID = ambientSessionId;
+  } else {
+    delete mcpEnv.ATC_SESSION_ID;
+  }
   return {
     ...sessionOptions,
     sessionId: defaultSessionId,
+    hasExplicitOrAmbientSession: Boolean(ambientSessionId),
     anchorPid: explicitAnchorPid,
     env: mcpEnv,
     ppid: hostAgentPid,
@@ -178,9 +187,10 @@ function resolveMcpCallOptions(sessionOptions = {}, toolArgs = {}) {
 export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
   if (!msg || typeof msg !== "object") return null;
   const { id, method, params } = msg;
-  const args =
+  const rawArgs =
     params?.arguments && typeof params.arguments === "object" ? params.arguments : {};
-  const callOptions = resolveMcpCallOptions(sessionOptions, args);
+  let args = rawArgs;
+  let callOptions = resolveMcpCallOptions(sessionOptions, args);
 
   if (method === "initialize") {
     return {
@@ -211,6 +221,50 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
 
   if (method === "tools/call") {
     const toolName = params?.name;
+    if (
+      toolName === "atc_claim" ||
+      toolName === "atc_free" ||
+      toolName === "atc_renew" ||
+      toolName === "atc_snapshot" ||
+      toolName === "atc_status" ||
+      toolName === "atc_guide"
+    ) {
+      const pendingHook = consumePendingMcpHookSession(stateDir, {
+        ...callOptions,
+        toolName,
+        args,
+        ppid: callOptions.ppid,
+        cwd: callOptions.cwd || process.cwd(),
+        ancestorPids: callOptions.ancestorPids,
+        explicitSession: callOptions.hasExplicitOrAmbientSession ? callOptions.sessionId : null,
+      });
+      if (
+        pendingHook?.error &&
+        (toolName === "atc_claim" ||
+          toolName === "atc_free" ||
+          toolName === "atc_renew" ||
+          toolName === "atc_snapshot")
+      ) {
+        const errRes = {
+          exitCode: 1,
+          code: "AmbiguousSessionError",
+          error: pendingHook.error,
+        };
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            isError: true,
+            content: [{ type: "text", text: JSON.stringify(errRes, null, 2) }],
+          },
+        };
+      }
+      if (pendingHook?.sessionId && !args.session && !args.role) {
+        args = { ...args, session: pendingHook.sessionId };
+        callOptions = resolveMcpCallOptions(sessionOptions, args);
+      }
+    }
+
     let res;
     if (toolName === "atc_claim") {
       res = cmdClaim(
